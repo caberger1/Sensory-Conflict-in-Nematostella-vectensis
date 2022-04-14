@@ -1,0 +1,421 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This [R Markdown](http://rmarkdown.rstudio.com) Notebook contains the code used to produce the analyses of locmotor behavior under temperature cycles in Nematostella vectensis (Berger & Tarrant 2022).
+
+Load libraries and set directory
+```{r}
+library(behavr)
+library(ggetho)
+library(damr)
+library(scopr)
+library(sleepr)
+library(zeitgebr)
+library(lomb)
+library(dplyr)
+library(circacompare)
+library(pracma)
+library(stringr)
+library(smooth)
+library(data.table)
+library(circular)
+library(DescTools)
+library(ggplot2)
+library(car)
+library(onewaytests)
+
+
+setwd("F:/circadian/temperature_cycles/")
+
+
+```
+
+This next chunk was used to calculate p-values based on the lomb-scargle periodogram (LSP) randomization. Not run because time-consuming. 
+```{r, eval=FALSE}
+
+#read in raw data
+df = read.csv("master_thin.csv")
+
+#smooths time seires with 4-pt centered moving average
+smoothed = apply(df, 1, function(j){
+  
+  dat = j[-c(1,2)]
+  
+  NAs = is.na(dat)
+  
+  smooth = cma(y=as.numeric(t(dat[!(NAs)]) ) , order=4)
+  
+  dat[!(NAs)] = smooth$fitted
+  
+  return(dat)
+})
+
+colnames(smoothed) = df$ID
+
+write.csv(t(smoothed), file="smoothed_temperature.csv")
+
+##LSP with p-values from 2000 permutations, restricted periods from 20-28
+rando_smooth_circ = apply(smoothed, 2, function(j, n=2000){
+  tmp = randlsp(repeats = n, x=as.numeric(j), type="period", ofac=50, from = 20, to=28, plot=FALSE, trace=FALSE)
+  return(summary(tmp))
+})
+
+#also check for circatidal rhythms, periods 10-14
+rando_smooth_tidal = apply(smoothed, 2, function(j, n = 2000){
+  tmp = randlsp(repeats = n, x=as.numeric(j), type="period", ofac=50, from = 10, to=14, plot=FALSE, trace=FALSE)
+  return(summary(tmp))
+})
+
+
+# This function parses the above output and corrects the p-values. P-values from permutation tests should not be zero, so we add 1/nperm to those values and then corect for multiple testing.
+p_lsp_fun <- function(x, perm=2000){
+  ps = as.numeric(lapply(x, function(i){return(i$Value[13])}))
+  power = as.numeric(lapply(x, function(i){return(i$Value[9])}))
+  period = as.numeric(lapply(x, function(i){return(i$Value[10])}))
+  
+  #correct p-value from lsp by adding 1/perm
+  p_correct = ( (ps*perm)+1 ) / (perm+1)
+  
+  print(paste0( length(which(p_correct < 0.01)), " unadjusted p-values < 0.01"))
+  
+  p_adjust = p.adjust(p_correct, method = "BH")
+  print(paste0( length(which(p_adjust < 0.01)), " adjusted p-values < 0.01"))
+  print(paste0( length(which(p_adjust < 0.005)), " adjusted p-values < 0.005"))
+  
+  return(cbind(p_adjust, power, period))
+}
+
+#
+p1 = p_lsp_fun(rando_smooth_circ, perm=2000)
+p2 = p_lsp_fun(rando_smooth_tidal, perm=2000)
+
+#also read in the other rhythmicity tests implemented in BioDare2
+
+R24 = read.csv("BioDare/BD2_eJTK.csv", skip=20)
+R35 =  read.csv("BioDare/BD2_18_35.csv", skip=20)
+
+MFF_28 = read.csv("BioDare/MFF_20_28.csv", skip=24)
+MFF_34 = read.csv("BioDare/MFF_18_34.csv", skip=24)
+FFT_28 = read.csv("BioDare/FFT_20_28.csv", skip=25)
+
+metadata <- data.table( ID = df$ID,
+                        BioDare_ID = 1:nrow(df),
+                        Offset = str_split(df$X, pattern="_", n=2, simplify=TRUE)[,1],
+                        Condition = str_split(df$X, pattern="_", n=2, simplify=TRUE)[,2], 
+                        p_28 = p1[,1],
+                        p_tidal = p2[,1],
+                        power_28 = p1[,2],
+                        power_tidal = p2[,2],
+                        p_24_BD2 = R24$emp.p.BH.Corrected,
+                        p_35_BD2 = R35$emp.p.BH.Corrected,
+                        MFF_period_28 = MFF_28$Period,
+                        MFF_period_34 = MFF_34$Period,
+                        MFF_phase_28 = MFF_28$Circ..Phase.To.Zero,
+                        MFF_phase_34 = MFF_34$Circ..Phase.To.Zero,
+                        FFT_period = FFT_28$Period,
+                        FFT_phase = FFT_28$Circ..Phase.To.Zero,
+                        FFT_error = FFT_28$ERR,
+                        key = "ID")
+
+metadata$Group = paste(metadata$Offset, metadata$Condition, sep="_")
+
+write.csv(metadata, "metadata_temperature.csv")
+```
+
+Read in the metadata. "Big" means a cycle from 8-32C, "small" means 14-26C. 
+```{r}
+
+metadata = read.csv("metadata_temperature.csv")
+metadata = data.table(metadata, key="ID")
+
+#rows 1-104 are individual animals, rows 105-108 are group means
+no_mean = metadata[1:104,]
+sig = no_mean[p_24_BD2 < 0.001,]
+
+#note that groups are not the same size
+groups = unique(no_mean$Group)
+
+n_sig = sapply(groups, function(g){
+  n = nrow(metadata[p_28 < 0.001 & Group == g, ])
+  return(n)
+})
+n_sig
+
+n_sig = sapply(groups, function(g){
+  n = nrow(metadata[p_24_BD2 < 0.001 & Group == g, ])
+  return(n)
+})
+n_sig
+
+#not surprisingly, the requirement that periods are exactly 24h is more stringent.
+
+ggplot(sig, aes(Condition, MFF_period_28, fill= Group)) + 
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha=.5) + theme_bw()
+
+#Even among animals with periods at 24, there are a range of periods. This is partly due to noise and the short-ish nature of the time series, as well as true biological variability (certainly for free-running). 
+
+ggplot(metadata, aes(Condition, power_28, fill= Group)) + 
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha=.5) + theme_bw()
+
+ggplot(metadata, aes(Condition, FFT_error, fill= Group)) + 
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha=.5) + theme_bw()
+
+wilcox.test(sig[Group=="Small_constant",]$power_28, sig[Group=="Small_cycle",]$power_28)
+#p=0.076
+wilcox.test(metadata[Group=="Big_constant",]$power_28, metadata[Group=="Big_cycle",]$power_28)
+#p=0.017
+
+```
+Let's do some simple statistics.
+
+```{r}
+#convert phases to radians
+conv <- 2*pi/24
+
+circ.mean <- function (x) 
+{
+  sinr <- sum(sin(x))
+  cosr <- sum(cos(x))
+  circmean <- atan2(sinr, cosr)
+  circmean
+}
+
+#calculate circular means of phases. 
+circ_means <- sapply(unique(sig$Group), function(x){
+  
+  circ.mean(conv*(sig[Group == x,]$MFF_phase_28))/conv
+})
+
+#also, make a column that puts the phases into circular data format
+metadata$circ = as.circular(metadata$MFF_phase_28, units = "hours", rotation="clock")
+no_mean = metadata[1:104,]
+
+sig=no_mean[p_24_BD2 < 0.001,]
+
+#Rayleigh test for circular uniformity
+sapply(groups, function(g){
+  res = rayleigh.test(sig[Group==g]$circ)
+  return(res$p.value)
+})
+
+#Significant for small cycle and marginally for big_cycle (our sample sizes are small). Nonsig. for free-running indicates that individuals with free-running rhythms are not synchronized with each other. We can visualize this:
+
+data.segm <- data.frame(x=0,y=0, circ_phase = circ_means,yend=1.5, Group = names(circ_means), 
+                        Offset = str_split(names(circ_means), pattern="_", n=2, simplify=TRUE)[,1],
+                        Condition = str_split(names(circ_means), pattern="_", n=2, simplify=TRUE)[,2])
+
+data.segm$Condition = factor(data.segm$Condition, levels=c("cycle", "constant"), labels=c("Cycle", "Free-run"))
+data.segm$Offset= factor(data.segm$Offset, levels=c("Small", "Big"), labels=c("14-26°C", "8-32°C"))
+
+sig$Condition = factor(sig$Condition, levels=c("cycle", "constant"), labels=c("Cycle", "Free-run"))
+sig$Offset= factor(sig$Offset, levels=c("Small", "Big"), labels=c("14-26°C", "8-32°C"))
+
+pl <- ggplot(sig, aes(x = MFF_phase_28, y=1, colour=Condition)) + geom_point(size=1.8) + theme_bw() + theme(axis.title.y=element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+pl <- pl + geom_segment(data=data.segm, aes(x=(circ_phase + 24) %% 24, y=0, xend=(circ_phase + 24) %% 24, yend=1.5), inherit.aes=FALSE)
+
+png(res=300, width=4, height=8, units='in', file="F:/circadian/plots/Temperature_phases_p24_01.png")
+pl + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + facet_grid(Offset~Condition) + theme(legend.position = "none")
+dev.off() 
+
+#We can also use circacompare to test for differences in phase between mean time series (using cosinors). need to fiddle with the formatting a bit. 
+
+phase_df = data.frame(matrix(NA, ncol = 3, nrow = 4 * 78))
+names(phase_df) = c("time", "measure", "group")
+phase_df$time = 6:83
+
+smooth <- read.csv("smoothed_temperature.csv")
+
+just_means = smooth[grepl("mean", smooth$X.1),]
+rownames(just_means) = just_means$X.1
+
+phase_df$measure = as.vector( t( just_means[,3:80] ) )
+
+phase_df$group = rep(rownames(just_means), each=78)
+
+##compare the two temperature cycles... 
+out <- circacompare(x = phase_df[phase_df$group == "Small_cycle_mean" | phase_df$group == "Big_cycle_mean", ], col_time = "time", col_group = "group", col_outcome = "measure", alpha_threshold = 0.3)
+
+#both time series are highly rythmic according to this method as well.
+#There is actually a highly significant difference between the phases, but just of 3h (ZT15 for big, ZT18 for small). 
+
+out <- circacompare(x = phase_df[phase_df$group == "Small_cycle_mean" | phase_df$group == "Small_constant_mean", ], col_time = "time", col_group = "group", col_outcome = "measure", alpha_threshold = 0.3)
+
+out
+#circacompare doesn't think there is a free-running rhythm at 24 (p=0.14). If we force it to, it thinks there is a phase shift of +8h in free-run. Remember, the LSP approach (which is significant) tested for periods between 20-28h, not 24h exactly.
+
+out <- circacompare(x = phase_df[phase_df$group == "Big_cycle_mean" | phase_df$group == "Big_constant_mean", ], col_time = "time", col_group = "group", col_outcome = "measure", alpha_threshold = 0.3)
+
+#similar here, although even circacomapre thinks the free-running is rhythmic. This time the phase shift is just +5. 
+out
+
+
+```
+
+
+And make some other figures...
+```{r}
+
+df = read.csv("activity_datasheet.csv")
+
+names(df)[3] = "Raw_distance"
+names(df)[4] = "Filtered_distance"
+names(df)[7] = "Percent_active"
+names(df)[9] = "Normalized_raw_movement"
+names(df)[10] = "Normalized_filtered_movement"
+
+smooth_fun = function(j){
+  smooth = cma(y=as.numeric(j) , order=4)
+  return(smooth$fitted)
+}
+
+#hooo boy 
+df <- df %>% group_by(ID) %>%  mutate(smoothed = smooth_fun(Normalized_filtered_movement))
+#df <- df %>% group_by(ID) %>% mutate(Det = detrend(smoothed))
+df = data.table(df, key = "ID")
+
+metadata$Condition = factor(metadata$Condition, levels=c("cycle", "constant"), labels=c("Cycle", "Free-run"))
+metadata$Offset= factor(metadata$Offset, levels=c("Small", "Big"), labels=c("14-26°C", "8-32°C"))
+
+
+dt = behavr(df[df$ID %in% metadata$ID,], metadata)
+dt$t = dt$bin * 3600
+
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = interaction(ID, Offset, Condition, sep = " : "), z=smoothed)) +
+  stat_tile_etho()
+
+#to group, change Y axis
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x = t, y = interaction(Offset, Condition, sep = " : "), z=smoothed)) +
+  stat_tile_etho() + stat_ld_annotations() + ggetho::scale_x_hours()
+
+pl
+
+
+
+animal = sig[sig$Group=="Small_cycle",]$ID[ which.max(sig[sig$Group=="Small_c",]$power_28) ]
+
+png(file="F:/circadian/plots/Temp_small.png", res=150, units="in", width=24, height=36)
+p <- ggetho(dt[dt$ID %in% sig[sig$Offset=="Small",]$ID,], summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_pop_etho() + stat_ld_annotations() +
+  facet_grid(ID ~ Condition) + ggetho::scale_x_hours() + theme_minimal() + theme(legend.position = "none")
+p
+dev.off()
+
+png(file="F:/circadian/plots/Temperature_plot_smooth.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_pop_etho() + stat_ld_annotations() +
+  facet_grid(Offset ~ .) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+
+png(file="F:/circadian/plots/Temperature_bars_indiv.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA) + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+#will colour in the rectangles with the temperature gradient later
+png(file="F:/circadian/plots/Temperature_indiv.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(ld_colours = c("white", "white")) + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+png(file="F:/circadian/plots/Temperature_indivs_minimal.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_minimal()
+dev.off()
+
+png(file="F:/circadian/plots/Temperature_day_plot.png", res=300, units="in", width=4, height=4)
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA) + stat_pop_etho() + theme_bw()
+pl
+dev.off()
+
+#for "sig" individuals...
+
+sig = metadata[p_24_BD2 < 0.001,]
+df_sig = df[df$ID %in% sig$ID,]
+dt = behavr(df_sig, sig)
+dt$t = dt$bin * 3600
+
+png(file="F:/circadian/plots/Temperature_sig_indiv.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(ld_colours = c("white", "white")) + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+
+png(file="F:/circadian/plots/Temperature_day_plot_sig_split.png", res=300, units="in", width=4, height=4)
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA) + facet_grid(Offset ~ Condition) + stat_pop_etho() + theme_bw()
+pl
+dev.off()
+
+```
+
+```{r}
+##while we're at it, let's briefly re-calculate the mean series from just the sig. individuals (we can see that the data are less noisy, which is expected)
+
+sig_df <- read.csv("Sig_datasheet.csv")
+
+
+##applies centered moving average of order 4
+smoothed = apply(sig_df, 1, function(j){
+  
+  dat = j[-c(1,2,3)]
+  
+  NAs = is.na(dat)
+  
+  smooth = cma(y=as.numeric(t(dat[!(NAs)]) ) , order=4)
+  
+  dat[!(NAs)] = smooth$fitted
+  
+  return(dat)
+})
+
+colnames(smoothed) = sig_df$ID
+
+#write.csv(t(smoothed), file="Sig_smoothed.csv")
+
+#just means
+smoothed <- smoothed[,grepl("mean", colnames(smoothed))]
+
+
+rando_smooth_circ = apply(smoothed, 2, function(j, n=2000){
+  tmp = randlsp(repeats = n, x=as.numeric(j), type="period", ofac=50, from = 20, to=28, plot=FALSE, trace=FALSE)
+  return(summary(tmp))
+})
+
+
+# perm is number of permutations done above
+p_lsp_fun <- function(x, perm=2000){
+  ps = as.numeric(lapply(x, function(i){return(i$Value[13])}))
+  power = as.numeric(lapply(x, function(i){return(i$Value[9])}))
+  period = as.numeric(lapply(x, function(i){return(i$Value[10])}))
+  
+  #correct p-value from lsp by adding 1/500 (or whatever)
+  p_correct = ( (ps*perm)+1 ) / (perm+1)
+  
+  print(paste0( length(which(p_correct < 0.01)), " unadjusted p-values < 0.01"))
+  
+  p_adjust = p.adjust(p_correct, method = "BH")
+  print(paste0( length(which(p_adjust < 0.01)), " adjusted p-values < 0.01"))
+  print(paste0( length(which(p_adjust < 0.005)), " adjusted p-values < 0.005"))
+ 
+  return(cbind(p_adjust, power, period))
+}
+
+
+p1 = p_lsp_fun(rando_smooth_circ, perm=2000)
+
+
+
+
+```
