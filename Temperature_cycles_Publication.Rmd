@@ -36,7 +36,7 @@ This next chunk was used to calculate p-values based on the lomb-scargle periodo
 ```{r, eval=FALSE}
 
 #read in raw data
-df = read.csv("master_thin.csv")
+df = read.csv("master_temperature.csv")
 
 #smooths time seires with 4-pt centered moving average
 smoothed = apply(df, 1, function(j){
@@ -261,7 +261,7 @@ out
 And make some other figures...
 ```{r}
 
-df = read.csv("activity_datasheet.csv")
+df = read.csv("activity_datasheet_temperature.csv")
 
 names(df)[3] = "Raw_distance"
 names(df)[4] = "Filtered_distance"
