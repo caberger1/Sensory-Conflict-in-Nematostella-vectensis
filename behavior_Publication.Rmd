@@ -1,0 +1,1662 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This [R Markdown](http://rmarkdown.rstudio.com) Notebook contains the code used to produce the analyses of locomotor behavior under simultaneous LD and temperature cycles in Nematostella vectensis (Berger et al. 2022).
+
+Load libraries and set directory
+```{r, warning=FALSE, message=FALSE}
+library(behavr)
+library(ggetho)
+library(damr)
+library(scopr)
+library(sleepr)
+library(zeitgebr)
+library(lomb)
+library(dplyr)
+library(circacompare)
+library(pracma)
+library(stringr)
+library(smooth)
+library(data.table)
+library(circular)
+library(DescTools)
+library(ggplot2)
+library(car)
+library(onewaytests)
+library(FSA)
+library(biwavelet)
+
+setwd("F:/circadian/sensory_conflict_out/")
+```
+
+This next chunk was used to calculate p-values based on the lomb-scargle periodogram (LSP) randomization. Not run because time-consuming. 
+```{r, eval=FALSE}
+
+#read in data from each trajectory. For free-run series, 1st 6 h are NA
+df = read.csv("master_datasheet.csv")
+
+##applies centered moving average of order 4
+smoothed = apply(df, 1, function(j){
+  
+  dat = j[-c(1,2)]
+  
+  NAs = is.na(dat)
+  
+  smooth = cma(y=as.numeric(t(dat[!(NAs)]) ) , order=4)
+  
+  dat[!(NAs)] = smooth$fitted
+  
+  return(dat)
+})
+
+colnames(smoothed) = df$ID
+
+
+write.csv(t(smoothed), file="smoothed.csv")
+
+rando_smooth_tidal = apply(smoothed, 2, function(j, n = 2000){
+  tmp = randlsp(repeats = n, x=as.numeric(j[18:78]), type="period", ofac=50, from = 10, to=14, plot=FALSE, trace=FALSE)
+  return(summary(tmp))
+})
+
+
+rando_smooth_circ = apply(smoothed, 2, function(j, n=2000){
+  tmp = randlsp(repeats = n, x=as.numeric(j), type="period", ofac=50, from = 20, to=28, plot=FALSE, trace=FALSE)
+  return(summary(tmp))
+})
+
+
+# perm is number of permutations done above
+p_lsp_fun <- function(x, perm=2000){
+  ps = as.numeric(lapply(x, function(i){return(i$Value[13])}))
+  power = as.numeric(lapply(x, function(i){return(i$Value[9])}))
+  period = as.numeric(lapply(x, function(i){return(i$Value[10])}))
+  
+  #correct p-value from lsp by adding 1/500 (or whatever)
+  p_correct = ( (ps*perm)+1 ) / (perm+1)
+  
+  print(paste0( length(which(p_correct < 0.01)), " unadjusted p-values < 0.01"))
+  
+  p_adjust = p.adjust(p_correct, method = "BH")
+  print(paste0( length(which(p_adjust < 0.01)), " adjusted p-values < 0.01"))
+  print(paste0( length(which(p_adjust < 0.005)), " adjusted p-values < 0.005"))
+ 
+  return(cbind(p_adjust, power, period))
+}
+
+
+p1 = p_lsp_fun(rando_smooth_circ, perm=2000)
+p2 = p_lsp_fun(rando_smooth_tidal, perm=2000)
+
+R24 = read.csv("BioDare/BD2_rhythm_24.csv", skip=20)
+R35 =  read.csv("BioDare/BD2_rhythm_35.csv", skip=20)
+
+MFF_28 = read.csv("BioDare/MFF_28.csv", skip=44)
+MFF_34 = read.csv("BioDare/MFF_34.csv", skip=44)
+
+FFT = read.csv("BioDare/FFT_28.csv", skip=44)
+
+####
+metadata <- data.table( ID = df$ID,
+                        BioDare_ID = 1:nrow(df),
+                        Offset = str_split(df$X, pattern="_", n=2, simplify=TRUE)[,1],
+                        Condition = str_split(df$X, pattern="_", n=2, simplify=TRUE)[,2], 
+                        p_28 = p1[,1],
+                        p_tidal = p2[,1],
+                        power_28 = p1[,2],
+                        power_tidal = p2[,2],
+                        p_24_BD2 = R24$emp.p.BH.Corrected,
+                        p_35_BD2 = R35$emp.p.BH.Corrected,
+                        MFF_period_28 = MFF_28$Period,
+                        MFF_period_34 = MFF_34$Period,
+                        MFF_phase_28 = MFF_28$Circ..Phase.To.Zero,
+                        MFF_phase_34 = MFF_34$Circ..Phase.To.Zero,
+                        MFF_phase_28_ABS = MFF_28$Abs.Phase.To.Zero,
+                        MFF_phase_34_ABS = MFF_34$Abs.Phase.To.Zero,
+                        MFF_amplitude = MFF_28$Amplitude,
+                        FFT_phase = FFT$Circ..Phase.To.Zero,
+                        FFT_period = FFT$Period,
+                        FFT_err = FFT$ERR,
+                        FFT_amplitude = FFT$Amplitude,
+                        key = "ID")
+
+metadata$Group = paste(metadata$Offset, metadata$Condition, sep="_")
+
+write.csv(metadata, "metadata_conflict.csv")
+
+```
+
+Read in the metadata. 
+```{r, warning=FALSE}
+###
+metadata = read.csv("metadata_conflict.csv")
+metadata = data.table(metadata, key="ID")
+
+
+metadata$Offset = factor(metadata$Offset, levels = c("ZT0", "ZT2", "ZT4", "ZT6", "ZT8", "ZT10", "ZT12"))
+
+metadata$circ = as.circular(metadata$MFF_phase_28, units = "hours", rotation="clock")
+
+dim(metadata)
+no_means = metadata[1:348,]
+
+groups = unique(no_means$Group)
+
+#note that ZT12_cycle has n=36, all the others are n=24
+
+n_sig = sapply(groups, function(g){
+  n = nrow(metadata[p_28 < 0.001 & Group == g, ])
+  return(n / nrow(metadata[Group ==g,]))
+})
+n_sig
+
+n_sig = sapply(groups, function(g){
+  n = nrow(metadata[p_24_BD2 < 0.001 & Group == g, ])
+  return(n / nrow(metadata[Group ==g,]))
+})
+n_sig
+
+no_means$Condition = factor(no_means$Condition, levels = c("cycle", "constant"), labels = c("Cycle", "Free-run"))
+sig = no_means[p_24_BD2 < 0.001,]
+
+png(res=300, width=6, height=4, units='in', file="F:/circadian/Supplement/Periods.png")
+ggplot(sig, aes(Condition, MFF_period_28, fill= Offset)) + 
+  geom_boxplot(outlier.colour = NA) + labs(y = "Period", fill="Group") + 
+  scale_fill_discrete(name = "Group", labels = c("Aligned", "Off2","Off4","Off6", "Off8", "Off10", "Off12")) + 
+  theme_bw()
+dev.off()
+
+leveneTest(y = sig$MFF_period_28, group = sig$Condition)
+
+#indeed... "Across all treatment groups, free-running periods had a wider variance than cycling periods (Levene's test for variance homogeneity, p = 1e-4)"
+
+levene <- leveneTest(y = sig[sig$Condition=="Cycle",]$MFF_period_28, group = sig[sig$Condition=="Cycle",]$Offset)
+#p=0.02
+
+levene <- leveneTest(y = sig[sig$Condition=="Free-run",]$MFF_period_28, group = sig[sig$Condition=="Free-run",]$Offset)
+#p=0.7 #so no differences in Free-running.
+
+#Post-hoc tests: are any of the groups different compared to Align?
+
+test <- sig[sig$Condition=="Cycle",]
+test <- test %>% group_by(Offset) %>% 
+  mutate(Period_median = median(MFF_period_28))
+
+#absolute value of period residuals
+test$Period_residuals <- abs(test$MFF_period_28 - test$Period_median)
+
+raw_p <- pairwise.t.test(test$Period_residuals, test$Offset, p.adjust.method = "none")
+p_adj <- p.adjust(raw_p$p.value[,1], method="BH")
+#none are significant here
+
+
+k = kruskal.test(MFF_period_28 ~ Group, data = sig)
+
+"However, there was no sig. difference in mean period between any groups (Kruskal-Wallis rank sum test, p = 0.096)."
+
+
+
+ggplot(sig, aes(fill = Condition, x = Offset)) + geom_bar(position="dodge") + theme_bw() + ggtitle("nsig  eJTK < 0.005")
+
+no_means$Group = factor(no_means$Group, levels=c("ZT0_constant", "ZT0_cycle", "ZT2_constant" , "ZT2_cycle", "ZT4_constant", "ZT4_cycle", "ZT6_constant","ZT6_cycle","ZT8_constant","ZT8_cycle", "ZT10_constant", "ZT10_cycle", "ZT12_constant", "ZT12_cycle") )
+#plot power across groups
+png(res=300, width=6, height=4, units='in', file="F:/circadian/Supplement/Power.png")
+ggplot(no_means, aes(y = power_28, fill = Condition, x = Group, group=Group)) + geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha=.5, width=0.1) + theme_bw() + labs(y="LSP Power")
+dev.off()
+
+
+```
+
+```{r}
+#convert phases to radians
+conv <- 2*pi/24
+
+circ.mean <- function (x) 
+{
+  sinr <- sum(sin(x))
+  cosr <- sum(cos(x))
+  circmean <- atan2(sinr, cosr)
+  circmean
+}
+
+#calculate circular means of phases. 
+circ_means <- sapply(unique(sig$Group), function(x){
+  
+  circ.mean(conv*(sig[Group == x,]$MFF_phase_28))/conv
+})
+
+#Rayleigh test for circular uniformity
+sapply(groups, function(g){
+  res = rayleigh.test(sig[Group==g]$circ)
+  return(res$p.value)
+})
+
+data.segm <- data.frame(x=0,y=0, circ_phase = circ_means,yend=1.5, Group = names(circ_means), 
+                        Offset = str_split(names(circ_means), pattern="_", n=2, simplify=TRUE)[,1],
+                        Condition = str_split(names(circ_means), pattern="_", n=2, simplify=TRUE)[,2])
+
+data.segm$Condition = factor(data.segm$Condition, levels=c("cycle", "constant"), labels=c("Cycle", "Free-run"))
+data.segm$Offset= factor(data.segm$Offset, levels=c("ZT0", "ZT2", "ZT4", "ZT6", "ZT8", "ZT10", "ZT12"), labels=c("Aligned", "2h", "4h", "6h", "8h", "10h", "12h"))
+
+sig$Offset= factor(sig$Offset, levels=c("ZT0", "ZT2", "ZT4", "ZT6", "ZT8", "ZT10", "ZT12"), labels=c("Aligned", "2h", "4h", "6h", "8h", "10h", "12h"))
+
+pl <- ggplot(sig, aes(x = MFF_phase_28, y=1, colour=Group)) + geom_point(size=1.8) + theme_bw() + theme(axis.title.y=element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+pl <- pl + geom_segment(data=data.segm, aes(x=(circ_phase + 24) %% 24, y=0, xend=(circ_phase + 24) %% 24, yend=1.5), inherit.aes=FALSE)
+
+png(res=300, width=8, height=4, units='in', file="F:/circadian/plots/SC_phases_wide.png")
+pl + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + facet_grid(.~Group) + theme(legend.position = "none")
+dev.off() 
+
+pl <- ggplot(sig, aes(x = MFF_phase_28, y=1, colour=Condition)) + geom_point(size=1.8) + theme_bw() + theme(axis.title.y=element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+pl <- pl + geom_segment(data=data.segm, aes(x=(circ_phase + 24) %% 24, y=0, xend=(circ_phase + 24) %% 24, yend=1.5), inherit.aes=FALSE)
+
+png(res=600, width=4, height=8, units='in', file="F:/circadian/plots/Fig_Behavior/SC_phases_legit.png")
+pl + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + facet_grid(Offset~Condition) + theme(legend.position = "none")
+dev.off() 
+
+##Circa_compare (I will revisit this later, but for now just compare Cycle and Free-run Align)
+
+phase_df = data.frame(matrix(NA, ncol = 3, nrow = 14 * 78))
+names(phase_df) = c("time", "measure", "group")
+phase_df$time = 6:83
+
+smooth <- read.csv("smoothed.csv")
+
+just_means = smooth[grepl("mean", smooth$X),]
+rownames(just_means) = just_means$X
+
+phase_df$measure = as.vector( t( just_means[,2:79] ) )
+
+phase_df$group = rep(rownames(just_means), each=78)
+
+out <- circacompare(x = phase_df[phase_df$group == "ZT0_cycle_mean" | phase_df$group == "ZT0_constant_mean", ], col_time = "time", col_group = "group", col_outcome = "measure", alpha_threshold = 1)
+
+#significant phase dif, 3h. Also significantly lower amplitude. 
+
+out <- circacompare(x = phase_df[phase_df$group == "ZT0_cycle_mean" | phase_df$group == "ZT12_cycle_mean", ], col_time = "time", col_group = "group", col_outcome = "measure", alpha_threshold = 1)
+
+
+out <- circacompare(x = phase_df[phase_df$group == "ZT0_constant_mean" | phase_df$group == "ZT12_constant_mean", ], col_time = "time", col_group = "group", col_outcome = "measure", alpha_threshold = 1)
+
+#circular variance of rhythmic individuals
+
+var.circular(sig[sig$Group=="ZT0_cycle",]$circ)
+#0.34
+var.circular(sig[sig$Group=="ZT12_cycle",]$circ)
+#0.86
+var.circular(sig[sig$Group=="ZT0_constant",]$circ)
+#0.35
+var.circular(sig[sig$Group=="ZT12_constant",]$circ)
+#0.80
+```
+
+
+Let's look at a few simple measures for how SC affects the strength of rhythms.
+```{r}
+#LSP (periodogram) power
+
+means <- metadata[349:362,]
+
+ggplot(means, aes(x = Offset, y = power_28, fill=Condition))+ geom_col(position="dodge")
+#the ones with really low power are: 10 + 12 cycle, 6+10+12 free run
+
+#but we can test this by looking at individual time series. 
+
+ggplot(no_means, aes(x = Offset, y = power_28, color=Condition))+ geom_point() + geom_smooth(aes(group=Condition), method='lm') + facet_grid(.~Condition)
+#so there is a clear decreasing trend for cycles, but not so much for free-run. Let's test. I'm interested in which groups have significantly lower power relative to Align, so I'll use an Anova with post-hoc tests. 
+
+#data are not normal and log-transofrmation doesnt' help, so I'll use a nonparamteric anova.
+shapiro.test(no_means$power_28) #p<0.05
+shapiro.test(log(no_means$power_28)) #p<0.05
+
+k = kruskal.test(power_28 ~ Group, data = no_means)
+#p=4e-6, so there is at least on sig. difference.
+
+#I'm only interested in comparing to the control, so I will only use those comparisons and adjust the p-values myself.
+DT <- dunnTest(power_28 ~ Group, no_means)
+
+Align_comparisons <- DT$res[grepl("ZT0", DT$res$Comparison),]
+
+#and just ones that are comparing Cycle to cycle or constant to constant
+Align_comparisons <- Align_comparisons[c(2,5,6,9,10,13,14,17,18,21,22,25),]
+
+Align_comparisons$P.adj <- p.adjust(Align_comparisons$P.unadj, method="BH")
+#the only ones that are significantly different are ZT10 and ZT12 cycle (p=0.02, p=0.005). 6_constant is perhaps marginal (p=0.13).
+
+#"FFT_error" is a similar signal-to-noise type metric produce by the FFT method in BioDare. Let's do the same thing with that.
+
+ggplot(means, aes(x = Offset, y = FFT_error, fill=Condition))+ geom_col(position="dodge")
+#We still see apretty clear increase (this time, high numbers are bad) in 6+10+12 cycle. ZT0 mean is actually fairly high, and only ZT4... and ZT12 free run are higher.
+
+ggplot(no_means, aes(x = Offset, y = FFT_error, color=Condition))+ geom_point() + geom_smooth(aes(group=Condition), method='lm') + facet_grid(.~Condition)
+#not much of a trend here, to be honest
+
+#data are not normal and log-transformation doesn't' help, so I'll use a nonparamteric anova.
+shapiro.test(no_means$FFT_error) #p<0.05
+shapiro.test(log(no_means$FFT_error)) #p<0.05
+
+k = kruskal.test(FFT_error ~ Group, data = no_means)
+#p=0.14, so no differences! Maybe this isn't a great measure of error for these data (they are all fairly noisy, I suspect).
+
+#What about a slightly more complicated analysis? Can we regress power against a numeric version of Offset? 
+no_means$SC <- as.numeric(sub("..", "", no_means$Offset))
+
+res <- lm(power_28 ~ SC, data=no_means[no_means$Condition=="cycle",])
+summary(res)
+#p = 2.4e-6; there is a negative relationship between light/temperature offset and LSP power.
+
+res <- lm(power_28 ~ SC, data=no_means[no_means$Condition=="constant",])
+summary(res)
+#but no such relationship exists during free-running. 
+
+```
+
+
+
+
+
+Amplitude is another obvious measure of the strength of a rhythm. However, in this case the individual behavior profiles are all normalized to the same interval, so the only measure of amplitude that is really meaningful is the mean profiles.
+```{r}
+
+plot(metadata$MFF_amplitude, metadata$FFT_amplitude)
+#these 2 measures of amplitude are well-correlated, with a few outliers and different scales
+
+ggplot(means, aes(x = Offset, y = MFF_amplitude, fill=Condition))+ geom_col(position="dodge")
+ggplot(means, aes(x = Offset, y = FFT_amplitude, fill=Condition))+ geom_col(position="dodge")
+
+#There's nothing to test here, but we can see some of the same trends. We can use CircaCompare to actually test this stuff, though...
+
+##enter numbers corresponding to order in just_means
+Amp_test <- function(n1, n2){
+  name1 = rownames(just_means)[n1]
+  name2 = rownames(just_means)[n2]
+  
+  out <- circacompare(x = phase_df[phase_df$group == name1 | phase_df$group == name2, ], col_time = "time", col_group = "group",col_outcome = "measure", alpha_threshold = 1)
+  
+  #return amplitude difference, p-value
+  return(c(out$summary[c(9,10),2]) )
+}
+
+rownames(just_means)
+
+Cycle_compare <- sapply(c(11, 9, 3, 13, 7, 5), Amp_test, n1=1)
+Free_compare <- sapply(c(12, 10, 4, 14, 8, 6), Amp_test, n1=2)
+
+out <- rbind(t(Cycle_compare), t(Free_compare))
+out <- data.frame( rbind(t(Cycle_compare), t(Free_compare)) )
+names(out) <- c("Amp_dif", "p")
+out$padj <- p.adjust(out$p, method="BH")
+
+
+
+```
+Now, let's do a more in-depth analysis of the phases of these rhythms. 
+
+```{r, warnings=FALSE}
+
+#We can test for phase differences of mean time series using CircaCompare, as above
+Phase_test <- function(n1, n2){
+  name1 = rownames(just_means)[n1]
+  name2 = rownames(just_means)[n2]
+  out <- circacompare(x = phase_df[phase_df$group == name1 | phase_df$group == name2, ], col_time = "time", col_group = "group",col_outcome = "measure", alpha_threshold = 1)
+  
+  #return amplitude difference, p-value
+  return(c(out$summary[c(13,14),2]) )
+}
+
+Cycle_compare <- sapply(c(11, 9, 3, 13, 7, 5), Phase_test, n1=1)
+Free_compare <- sapply(c(12, 10, 4, 14, 8, 6), Phase_test, n1=2)
+out <- data.frame( rbind(t(Cycle_compare), t(Free_compare)) )
+names(out) <- c("Phase_dif", "p")
+out$padj <- p.adjust(out$p, method="BH")
+
+out$sig = out$padj< 0.05
+#6_cycle +2, 10_cycle -3, 2_free -2, 8_free -4, 12_free -4
+
+#We've already used the Rayleigh test to look at phase non-uniformity.
+ray <- sapply(groups, function(g){
+  res = rayleigh.test(sig[Group==g]$circ)
+  return(res$p.value)
+})
+
+p.adjust(ray, method="BH") < 0.05
+
+#what if we use a more relaxed "rhythmicity" cutoff?
+sig <- no_means[p_24_BD2 < 0.01,]
+
+
+ray <- sapply(groups, function(g){
+  res = rayleigh.test(sig[Group==g]$circ)
+  return(res$p.value)
+})
+
+p.adjust(ray, method="BH") < 0.05
+  
+#back to the original definition...
+sig <- no_means[p_24_BD2 < 0.001,]
+
+means$Circ_var <- 0
+
+for (group in means$Group){
+  name=sub("_mean", "", group)
+  
+  means[means$Group ==group,]$Circ_var <- var.circular(sig[sig$Group==name,]$circ)
+}
+
+ggplot(means, aes(x = Offset, y = Circ_var, fill=Condition))+ geom_col(position="dodge")
+
+
+
+#It may be more powerful to compare the phases of individuals within and across groups. We can use a bootstrapped version of the Watson test for a difference in mean direction--this nonparamteric approach is necessary because our data definitely won't meet the assumptions of the paramteric version (Von mises distributions, shared concentration paramter...) 
+
+library(AS.circular)
+##I had to slightly modify the source code in order to fix an error that returned NA instead of TRUE/FALSE
+watson.mean.test.boot_FIX <- function(samples, B = 9999, show.progress = T){
+  data <- unlist(samples)
+  N <- length(data)
+  g <- length(samples)
+  sample.sizes <- c()
+  g.id <- c()
+  for (i in 1:g) {
+    sample.sizes[i] <- length(samples[[i]])
+    g.id <- c(g.id, rep(i, sample.sizes[i]))
+  }
+  delhat <- c()
+  tbar <- c()
+  centdat <- c()
+  for (k in 1:g) {
+    sample <- samples[[k]]
+    tm1 <- trigonometric.moment(sample, p = 1)
+    tm2 <- trigonometric.moment(sample, p = 2)
+    Rbar1 <- tm1$rho
+    Rbar2 <- tm2$rho
+    tbar[k] <- tm1$mu%%(2 * pi)
+    delhat[k] <- (1 - Rbar2)/(2 * Rbar1 * Rbar1)
+    centsamp <- circular(sample - tbar[k])
+    centdat <- circular(c(centdat, centsamp))
+  }
+  dhatmax <- max(delhat)
+  dhatmin <- min(delhat)
+  if (dhatmax/dhatmin <= 4) {
+    PorM <- 1
+    CP <- 0
+    SP <- 0
+    dhat0 <- 0
+    for (k in 1:g) {
+      CP <- CP + sample.sizes[k] * cos(tbar[k])
+      SP <- SP + sample.sizes[k] * sin(tbar[k])
+      dhat0 <- dhat0 + sample.sizes[k] * delhat[k]
+    }
+    dhat0 <- dhat0/N
+    RP <- sqrt(CP * CP + SP * SP)
+    Yg <- 2 * (N - RP)/dhat0
+  }
+  else {
+    PorM <- 0
+    CM <- 0
+    SM <- 0
+    Yg <- 0
+    for (k in 1:g) {
+      CM <- CM + (sample.sizes[k] * cos(tbar[k])/delhat[k])
+      SM <- SM + (sample.sizes[k] * sin(tbar[k])/delhat[k])
+      Yg <- Yg + (sample.sizes[k]/delhat[k])
+    }
+    RM <- sqrt(CM * CM + SM * SM)
+    Yg <- 2 * (Yg - RM)
+  }
+  YgObs <- Yg
+  nxtrm <- 1
+  if (show.progress) {
+    pb <- txtProgressBar(min = 0, max = B, style = 3)
+  }
+  for (b in 1:B) {
+    for (k in 1:g) {
+      centsamp <- centdat[g.id == k]
+      bootsamp <- sample(centsamp, size = sample.sizes[k], 
+                         replace = TRUE)
+      tm1 <- trigonometric.moment(bootsamp, p = 1)
+      tm2 <- trigonometric.moment(bootsamp, p = 2)
+      Rbar1 <- tm1$rho
+      Rbar2 <- tm2$rho
+      tbar[k] <- tm1$mu
+      delhat[k] <- (1 - Rbar2)/(2 * Rbar1 * Rbar1)
+    }
+    if (PorM == 1) {
+      CP <- 0
+      SP <- 0
+      dhat0 <- 0
+      for (k in 1:g) {
+        CP <- CP + sample.sizes[k] * cos(tbar[k])
+        SP <- SP + sample.sizes[k] * sin(tbar[k])
+        dhat0 <- dhat0 + sample.sizes[k] * delhat[k]
+      }
+      dhat0 <- dhat0/N
+      RP <- sqrt(CP * CP + SP * SP)
+      Yg <- 2 * (N - RP)/dhat0
+    }
+    else {
+      CM <- 0
+      SM <- 0
+      Yg <- 0
+      for (k in 1:g) {
+        CM <- CM + (sample.sizes[k] * cos(tbar[k])/delhat[k])
+        SM <- SM + (sample.sizes[k] * sin(tbar[k])/delhat[k])
+        Yg <- Yg + (sample.sizes[k]/delhat[k])
+      }
+      RM <- sqrt(CM * CM + SM * SM)
+      Yg <- 2 * (Yg - RM)
+    }
+    YgBoot <- Yg
+    if (is.na(YgBoot)){
+      YgBoot = 0
+    }
+    if (YgBoot >= YgObs) {
+      nxtrm <- nxtrm + 1
+    }
+    if (show.progress) {
+      setTxtProgressBar(pb, b)
+    }
+  }
+  if (show.progress) {
+    close(pb)
+  }
+  pval <- nxtrm/(B + 1)
+  list(statistic = YgObs, p.value = pval, disp.ratio = dhatmax/dhatmin)
+}
+
+
+sig$MFF_phase_rad = conv*(sig$MFF_phase_28)
+
+##just type numbers corresponding to order in just_means
+phase_boot_test <- function(n1, n2){
+  name1 = unique(sig$Group)[n1]
+  name2 = unique(sig$Group)[n2]
+  
+  
+  out <- watson.mean.test.boot_FIX(list(sig[sig$Group == name1]$MFF_phase_rad, sig[sig$Group == name2]$MFF_phase_rad), B=9999)
+  
+  return(out$p.value)
+}
+
+#ZT0 cycle and constant
+tmp = phase_boot_test(12, 13)
+#p=0.0015
+
+ref = which(unique(sig$Group) == "ZT0_cycle")
+others = c(8, 6, 14, 10, 4, 2)
+
+cyc_out = sapply(others, phase_boot_test, n1 = ref)
+#6h, p=0.0046
+ref = which(unique(sig$Group) == "ZT0_constant")
+others = c(9, 7, 1, 11, 5, 3)
+
+free_out = sapply(others, phase_boot_test, n1 = ref)
+
+p.adjust(c(tmp, cyc_out, free_out), method="BH")
+
+#0_free run p=0.02, 6_cycle p=0.035
+
+circ_means = sapply(unique(sig$Group), function(g){
+  mean.circular(sig[sig$Group==g,]$circ)
+})
+
+means$Circ_mean <- 0
+
+for (group in means$Group){
+  name=sub("_mean", "", group)
+  
+  means[means$Group ==group,]$Circ_mean <- mean.circular(sig[sig$Group==name,]$circ)
+}
+
+ggplot(means, aes(x = SC, y = Circ_mean%%24, color=Condition))+ geom_point()
+
+#We could try to do a type of regression analysis, accounting for the fact that phase is a circular thing. 
+
+##I don't really know whats' going on with this stuff. 
+
+sig$SC <- as.numeric(sub("..","",sig$Offset))
+
+y = sig[Condition == "Cycle",]$circ
+x = cbind( sig[Condition == "Cycle",]$SC, rep(12, length(y)) )
+
+x =sig[Condition == "Cycle",]$SC
+
+
+res = lm.circular(y=y, x=x, type="c-l", init = c(0,0), verbose=T)
+#so the slope is signficant... -0.8671, p=0.04. Um, this means that, for every degree of SC, the phase is reduced by -0.87? 
+
+
+res_fit = res$coefficients[2] + res$coefficients[1]*x[order(x[,1]), 1]
+
+plot.default(x[,1], y)
+
+points.default(x[order(x[,1]) , 1], res_fit%%24, type='l')
+
+
+####
+n = nls(y~a+2*atan(b*x),start=c(a=0,b=0),data=list(x=x,y=y))
+wa = summary(n)
+
+res_fit = wa$coefficients[1] +  wa$coefficients[2]*x[order(x)]
+
+plot.default(x, y)
+points.default(x[order(x)], res_fit%%24, type='l')
+
+#so the slope is not signficant using a standard nonlinear regression
+
+##
+
+y = sig[Condition == "Cycle",]$circ
+x = as.circular(sig[Condition == "Cycle",]$SC, units = "hours", rotation="clock")
+
+circ_lm = lm.circular(y=y, x=x, order=1)
+
+plot.default(x, y)
+circ_lm$fitted[circ_lm$fitted < 0] <- circ_lm$fitted[circ_lm$fitted < 0] + 24
+
+points.default(x[order(x)], circ_lm$fitted[order(x)], type='l')
+
+cor.circular(y, x, test=T)
+
+y = sig[Condition == "Free-run",]$circ
+x = as.circular(sig[Condition == "Free-run",]$SC, units = "hours", rotation="clock")
+
+circ_lm = lm.circular(y=y, x=x, order=1)
+
+plot.default(x, y)
+circ_lm$fitted[circ_lm$fitted < 0] <- circ_lm$fitted[circ_lm$fitted < 0] + 24
+
+points.default(x[order(x)], circ_lm$fitted[order(x)], type='l')
+cor.circular(y, x, test=T)
+
+res = lm.circular(y=sig$circ, x=cbind(sig$MFF_period_28, rep(1,nrow(sig)) ), type="c-l", init = c(0,0), verbose=T)
+
+
+res_fit = res$coefficients[2] + res$coefficients[1]*(x[order(x[,1]), 1]-1)
+
+plot.default(x[,1], y)
+
+points.default(x[order(x[,1]) , 1], res_fit%%24, type='l')
+
+###Here, I am interested in the relationship between phase and period. It has often been observed e.g. in cell lines that clocks with longer (free-running) periods entrain later relative to the ZT. Let's test this.
+
+
+```
+#What is we use FFT instead of MFF to estimate the phases?
+```{r, warnings=FALSE}
+
+no_means$circ_FFT <- as.circular(no_means$FFT_phase, units = "hours", rotation="clock")
+
+cor.circular(no_means$circ, no_means$circ_FFT, test=TRUE)
+#obviously it's significant, r = 0.41, so it's not a one-to-one.
+
+dif = abs(no_means$circ - no_means$circ_FFT)
+
+dif[dif>12] = 24-dif[dif>12] 
+
+#119/348 > 4, 86/348 > 6, definitely some differences
+
+ggplot(no_means, aes(x= circ, y = circ_FFT, color=dif ) ) + geom_point() + theme_bw()
+
+sig <- no_means[no_means$p_24_BD2 < 0.001,]
+
+#We've already used the Rayleigh test to look at phase non-uniformity.
+ray <- sapply(groups, function(g){
+  res = rayleigh.test(sig[Group==g]$circ_FFT)
+  return(res$p.value)
+})
+
+p.adjust(ray, method="BH") < 0.05
+#TRUE: 10C, 4C, 2C, 8C, 0C, 6C
+#difference is 0F not pass (p=0.09, so marginal), 10C pass (p=0.005)
+
+#what if we use a more relaxed "rhythmicity" cutoff?
+sig <- no_means[p_24_BD2 < 0.01,]
+
+
+ray <- sapply(groups, function(g){
+  res = rayleigh.test(sig[Group==g]$circ_FFT)
+  return(res$p.value)
+})
+
+p.adjust(ray, method="BH") < 0.05
+#TRUE: 10C, 4C, 2C, 8C, 0C, 6C
+  
+#back to the original definition...
+sig <- no_means[p_24_BD2 < 0.001,]
+
+means$Circ_var_FFT <- 0
+
+for (group in means$Group){
+  name=sub("_mean", "", group)
+  
+  means[means$Group ==group,]$Circ_var_FFT <- var.circular(sig[sig$Group==name,]$circ_FFT)
+}
+
+ggplot(means, aes(x = Offset, y = Circ_var, fill=Condition))+ geom_col(position="dodge")
+ggplot(means, aes(x = Offset, y = Circ_var_FFT, fill=Condition))+ geom_col(position="dodge")
+#it's similar.
+
+sig$FFT_phase_rad <- conv*(sig$FFT_phase)
+
+##just type numbers corresponding to order in just_means
+phase_boot_test <- function(n1, n2){
+  name1 = unique(sig$Group)[n1]
+  name2 = unique(sig$Group)[n2]
+  
+  
+  out <- watson.mean.test.boot_FIX(list(sig[sig$Group == name1]$FFT_phase_rad, sig[sig$Group == name2]$FFT_phase_rad), B=9999)
+  
+  return(out$p.value)
+}
+
+#ZT0 cycle and constant
+tmp = phase_boot_test(12, 13)
+#p=2e-4
+
+ref = which(unique(sig$Group) == "ZT0_cycle")
+others = c(8, 6, 14, 10, 4, 2)
+
+cyc_out = sapply(others, phase_boot_test, n1 = ref)
+#6h, p=0.0046
+ref = which(unique(sig$Group) == "ZT0_constant")
+others = c(9, 7, 1, 11, 5, 3)
+
+free_out = sapply(others, phase_boot_test, n1 = ref)
+
+p.adjust(c(tmp, cyc_out, free_out), method="BH")
+#0_free run p=0.003
+#difference: 6_cycle not sig.
+
+circ_means = sapply(unique(sig$Group), function(g){
+  mean.circular(sig[sig$Group==g,]$circ_FFT)
+})
+
+means$Circ_mean_FFT <- 0
+
+for (group in means$Group){
+  name=sub("_mean", "", group)
+  
+  means[means$Group ==group,]$Circ_mean_FFT <- mean.circular(sig[sig$Group==name,]$circ_FFT)
+}
+
+ggplot(means, aes(x = SC, y = Circ_mean%%24, color=Condition))+ geom_point()
+
+##well, let's try to make that plot using FFT phases
+circ_means <- sapply(unique(sig$Group), function(x){
+  
+  circ.mean(conv*(sig[Group == x,]$FFT_phase))/conv
+})
+
+data.segm <- data.frame(x=0,y=0, circ_phase = circ_means,yend=1.5, Group = names(circ_means), 
+                        Offset = str_split(names(circ_means), pattern="_", n=2, simplify=TRUE)[,1],
+                        Condition = str_split(names(circ_means), pattern="_", n=2, simplify=TRUE)[,2])
+
+data.segm$Condition = factor(data.segm$Condition, levels=c("cycle", "constant"), labels=c("Cycle", "Free-run"))
+data.segm$Offset= factor(data.segm$Offset, levels=c("ZT0", "ZT2", "ZT4", "ZT6", "ZT8", "ZT10", "ZT12"), labels=c("Aligned", "2h", "4h", "6h", "8h", "10h", "12h"))
+
+pl <- ggplot(sig, aes(x = FFT_phase, y=1, colour=Condition)) + geom_point(size=1.8) + theme_bw() + theme(axis.title.y=element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+pl <- pl + geom_segment(data=data.segm, aes(x=(circ_phase + 24) %% 24, y=0, xend=(circ_phase + 24) %% 24, yend=1.5), inherit.aes=FALSE)
+
+png(res=300, width=4, height=8, units='in', file="F:/circadian/plots/SC_phases_FFT.png")
+pl + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + facet_grid(Offset~Condition) + theme(legend.position = "none")
+dev.off() 
+```
+
+
+So in summary, no earth-shaking differences between MFF and FFT phases. Main one is the phase shift/synchronization of ZT6_cycle. MFF may be somewhat more accurate for these data becuase it assumes the same underlying waveform for each cycle, whereas FFT can overfit to noise (Zielinski et al. 2014).
+
+#This next part is a different way of looking at the data. 
+```{r, warning=FALSE}
+library(nlme)
+library(forecast)
+
+df = read.csv("activity_datasheet.csv")
+
+#For free-running, skip the first 6 time points 
+df = df[df$bin > 11 | df$Condition == "cycle" ,]
+
+df$Offset = factor(df$Offset, levels = c( "0", "2", "4", "6", "8", "10", "12") )
+names(df)[5] = "Raw_distance"
+names(df)[6] = "Filtered_distance"
+names(df)[9] = "Percent_active"
+names(df)[11] = "Normalized_raw_movement"
+names(df)[12] = "Normalized_filtered_movement"
+
+df$Subj_Day = ifelse(df$ZT < 12, "Day", "Night")
+df$Light = ifelse(df$ZT < 12, "Light", "Dark")
+df$Light[df$Condition == "constant"] = "Dark"
+
+
+#one thing to note: there is, for most groups, a linear decrease in activity over time. Not unexpected, since they're not being fed
+p <- ggplot(data = df, aes(x = bin, y = Percent_active, color=Offset)) + geom_smooth(method = "lm", se=FALSE) + facet_grid(Condition ~ .)
+p + theme_bw()
+
+p <- ggplot(data = df, aes(x = bin, y = Percent_active, color=Offset, group=Offset)) + geom_smooth(span=0.5, se=FALSE) + facet_grid(Condition ~ .)
+p + theme_bw()
+
+
+#just to briefly illustrate the models we are using: a basic linear regression like this fails to consider autocorrelation and baseline differences in activity of individuals. We can account for these using a random effects model
+
+##### this model allows for random intercepts ie. dif't baseline activity levels for individuals)
+m1 = lme(Percent_active ~ bin, random = ~1|ID, data=df)
+summary(m1)
+#definitely still significant, but also there is a lot of autocorrelation in the residuals: 
+plot(ACF(m1))
+
+#We need to correct for autocorrelation. We can do this using the simplest possible correlation structure (corAR1) or by calculating the "best" autocorrelation structure of the residuals using auto.arima()
+res = residuals(m1)
+auto.arima(res, ic='bic')
+##ARIMA(1,3) by AIC, (1,2) by BIC. 
+
+m2 = lme(Percent_active ~ bin, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+plot(ACF(m2, resType = "normalized"))
+##You can see that even the simplest possible correlation structure more or less gets rid of the autocorrelation. the better fit gets rid of a little more. But using corAR1 will be fine for subsequent analyses.
+
+m3 = lme(Percent_active ~ bin, random = ~1|ID, correlation=corARMA(form= ~bin|ID, p=1, q=2), data=df)
+plot(ACF(m3, resType = "normalized"))
+
+
+#so does the rate of decrease differ between conditions?
+lm.activity = lme(Percent_active ~ bin*Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+summary(lm.activity)
+
+#anyway, after applying random intercepts and autocorrelation correction, we still see an overall decrease in time active, and a big difference between cycle and free-run. No interaction (same slopes). 
+
+lm.distance = lme(Filtered_distance ~ bin*Condition, random = ~ 1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+summary(lm.distance)
+
+#however, no significant decrease in distance covered over time. Big distance between cycle and free-run again
+
+##The important question is: are there differences in overall activity between groups?
+
+lm.activity = lme(Percent_active ~ Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition == "cycle",])
+summary(lm.activity)
+#marginal difference (p = 0.03) with ZT8, more time active. 
+
+lm.distance = lme(Filtered_distance ~ Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition == "cycle",])
+summary(lm.distance)
+#marginal difference (p = 0.03) with ZT8, more time active. 
+
+lm.distance = lme(Filtered_distance ~ as.numeric(Offset), random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition == "cycle",])
+summary(lm.distance)
+
+
+lm.activity = lme(Percent_active ~ Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition == "constant",])
+summary(lm.activity)
+#ZT2 constant is more active. ZT4 maybe also, p = 0.035
+
+
+lm.distance = lme(Filtered_distance ~ Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition == "constant",])
+summary(lm.distance)
+
+#so, not really. Is the RATE of decrease different between groups? 
+
+lm.activity = lme(Percent_active ~ bin*Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="cycle",])
+summary(lm.activity)
+#ZT12_cycle actually become MORE active with time (p=0.014), and ZT10 cycle decreases more quickly (p-0.05). ZT10 cycle is also overall more active (p-0.02). 
+lm.distance = lme(Filtered_distance ~ bin*Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="cycle",])
+summary(lm.distance)
+#same results with distance (p=0.002, p=0.10, p=0.03). 
+
+lm.activity = lme(Percent_active ~ bin*Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="constant",])
+summary(lm.activity)
+#ZT12_cons and ZT2_cons are LESS NEGATIVE (p=0.04, p=0.009), ZT6_cons is MORE ACTIVE with time (p=0.001), and also overall less active (p=0.02). 
+lm.distance = lme(Filtered_distance ~ bin*Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="constant",])
+summary(lm.distance)
+#ZT2, ZT4, and ZT6 MORE active (p=0.004, p=0.01, p=0.006), ZT10 less negative (p=0.07), and ZT6 less active overall (p=0.055).  
+
+```
+Phew! Well, I have a thought: there doesn't seem to be an enormous relationship between "time active" and "distance covered", indicating that the SPEED of these animals varies. Let's look into this:
+
+
+```{r}
+ggplot(df, aes(y=Percent_active, x=Filtered_distance)) + geom_point()
+#so we can see the sort of minimum and maximum speeds (which we have pre-filtered)
+
+ggplot(df, aes(y=com.speed.moving, fill=Condition)) + geom_histogram(position="dodge") 
+#these are slow animals lol should be in cm/s
+
+lm.SPEED <- lme(com.speed.moving ~ bin*Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df, na.action = na.omit)
+summary(lm.SPEED)
+#no significant differences.
+
+lm.SPEED <- lme(com.speed.moving ~ Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="cycle",], na.action = na.omit)
+summary(lm.SPEED)
+#4 and 8 are a bit faster (p=0.05, p=0.04)
+
+lm.SPEED <- lme(com.speed.moving ~ Offset, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="constant",], na.action = na.omit)
+summary(lm.SPEED)
+#10 is a lot faster. 
+
+#We'll come back to this: does speed vary in a circadian fashion?
+
+
+```
+Continue the lm stuff.
+```{r, warning=FALSE}
+###################
+##is there a difference in activity between cycle and free-run?
+
+m1 = lme(Percent_active ~ Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+plot(ACF(m1, resType = "normalized"))
+
+summary(m1)
+
+#cycle animals spend less time active than free-running.
+
+m2 = lme(Filtered_distance ~ Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+
+summary(m2)
+
+#and cover less distance.
+
+
+m2 = lme(Percent_active ~ Light + Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+plot(ACF(m2, resType = "normalized"))
+
+summary(m2)
+
+#light decreases activity, but even so free-running animals spend more time active.
+
+df$Subj_Day = factor(df$Subj_Day,levels = c("Night", "Day"))
+
+m3 = lme(Percent_active ~ Subj_Day * Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df)
+plot(ACF(m3, resType = "normalized"))
+
+summary(m3)
+##There is no difference between day and night overall in free-running. There is a difference due to cycle during the day, and and interaction between cycle and day. This means that cycle animals are less active than free-running animals, even during lights-off (Subjective Night).
+
+m4 = lme(Filtered_distance ~ Subj_Day * Condition, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Offset==0,])
+plot(ACF(m4, resType = "normalized"))
+
+###one way to think about the strength of circadian rhythms is to consider the difference in activity between night and day.
+
+m1 = lme(Percent_active ~ Offset * Subj_Day, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="cycle",])
+
+library(emmeans)
+#performs this contrast within each group
+emm_activity = emmeans(m1, specs = pairwise ~ Subj_Day|Offset, type = "response")
+emm_activity
+
+#compare difference between night and day between groups. 
+contrast(emmeans(m1, ~Subj_Day*Offset), interaction = "trt.vs.ctrl")
+#ZT6, ZT10, and ZT12 have significantly less of a distance between Day and Night compared to align (p<0.05. )
+#anemones spend significantly less time active during the day for all groups, but the difference decreases with sensory conflict. 
+
+contrast(emmeans(m1, ~Offset|Subj_Day), interaction = "trt.vs.ctrl")
+#also: differences in activity are apparent during the day, not the night. animals more active during the day at ZT8, ZT10, and ZT12 (p<0.05); these differenes not sig. at Night. 
+
+
+m1 = lme(Filtered_distance ~ Offset * Subj_Day, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="cycle",])
+
+#performs this contrast within each group
+emm_dist = emmeans(m1, specs = pairwise ~ Subj_Day|Offset, type = "response")
+emm_dist
+
+contrast(emmeans(m1, ~Subj_Day*Offset), interaction = "trt.vs.ctrl")
+#here, just ZT12 has a difference (p=2e-4)
+
+contrast(emmeans(m1, ~Offset|Subj_Day), interaction = "trt.vs.ctrl")
+#8 and 12, marginally for 10. 8 night. 
+
+#significant interactions between Light and ZT10, ZT12
+##in terms of distance moved, we actually see no significant difference at ZT12, and this is a significant interaction. 
+
+m1 = lme(Percent_active ~ Offset * Subj_Day, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="constant",])
+
+#performs this contrast within each group
+emm1 = emmeans(m1, specs = pairwise ~ Subj_Day|Offset, type = "response")
+emm1
+
+#there is no sig. difference in %time active for any group during free-run.
+
+m1 = lme(Filtered_distance ~ Offset * Subj_Day, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="constant",])
+
+emm1 = emmeans(m1, specs = pairwise ~ Subj_Day|Offset, type = "response")
+emm1
+
+#this is because, even when there are free-running rhythms, they drift from 24h.
+
+
+##SPEEED#########
+m1 = lme(com.speed.moving ~ Offset * Subj_Day, random = ~1|ID, correlation=corAR1(form= ~ bin | ID), data=df[df$Condition=="cycle",], na.action=na.omit)
+
+#on the whole, animals are slower during the day (p=0.03). 
+
+emm1 = emmeans(m1, specs = pairwise ~ Subj_Day|Offset, type = "response")
+emm1
+#but only sig for ZT0 and ZT4. 
+
+contrast(emmeans(m1, ~Subj_Day*Offset), interaction = "trt.vs.ctrl")
+#the ratios are marginally different for ZT10 and ZT12 (p=0.06 and p=0.03) (they're actually slightly more active during the day)
+
+contrast(emmeans(m1, ~Offset|Subj_Day), interaction = "trt.vs.ctrl")
+#8 and 4 are slightly faster both during day and night. 
+
+#Not sure how to interpret this, really
+
+
+
+########
+#Make a figure of percent activity and distance covered (bar chart)
+########
+
+to_plot <- df[df$Condition=="cycle",] %>% group_by(Offset, Light) %>% summarize(mean_activity=mean(Percent_active), SE = std_err(Percent_active))
+
+png(res=600, units='in', width=4, height=4, file="F:/circadian/plots/Fig_Behavior/Mean_activity_tall.png")
+ggplot(to_plot, aes(x=Offset, y=mean_activity, fill=Light)) + geom_col(position="dodge", color="black") + geom_errorbar(aes(ymin=mean_activity-SE, ymax=mean_activity+SE), width=0.4, position=position_dodge(0.9)) + theme_bw() +  scale_fill_grey() + labs(title="Activity during dark and light phases", x ="Offset (h)", y = "% time active") + ylim(c(0,30))
+dev.off()
+
+#just to illustrate: no dif for free-running
+to_plot <- df[df$Condition=="constant",] %>% group_by(Offset, Subj_Day) %>% summarize(mean_activity=mean(Percent_active))
+
+ggplot(to_plot, aes(x=Offset, y=mean_activity, fill=Subj_Day)) + geom_col(position="dodge") + theme_bw()
+
+##and for distance:
+to_plot <- df[df$Condition=="cycle",] %>% group_by(Offset, Light) %>% summarize(mean_dist=mean(Filtered_distance), SE = std_err(Filtered_distance))
+
+png(res=300, units='in', width=4, height=4, file="F:/circadian/plots/Distance_tall.png")
+ggplot(to_plot, aes(x=Offset, y=mean_dist, fill=Light)) + geom_col(position="dodge", color="black") + geom_errorbar(aes(ymin=mean_dist-SE, ymax=mean_dist+SE), width=0.4, position=position_dodge(0.9)) + theme_bw() +  scale_fill_grey() + labs(title="Distance moved during dark and light phases", x ="Offset (h)", y = "Distance moved (cm/h)") + ylim(c(0,150))
+dev.off()
+
+#plotting difference, and then ratio, with appropriate error bars
+#this is difference, not ratio
+difference_plot <- data.frame(confint(emm_activity)$contrasts)
+
+png(res=600, units='in', width=4, height=4, file="F:/circadian/plots/Fig_Behavior/LD_diff_activ.png")
+ggplot(difference_plot, aes(x=Offset, y=estimate)) + geom_point(color="black") + theme_bw() + geom_errorbar(aes(ymin=lower.CL, ymax=upper.CL), width=0.4) + labs(title="Dark-light difference, activity", x ="Offset (h)", y = "% time active, dark - light") + geom_hline(yintercept=0) + theme(text=element_text(size=14))
+dev.off()
+
+difference_plot <- data.frame(confint(emm_dist)$contrasts)
+
+png(res=600, units='in', width=4, height=4, file="F:/circadian/plots/Fig_Behavior/LD_diff_dist.png")
+ggplot(difference_plot, aes(x=Offset, y=estimate)) + geom_point(color="black") + theme_bw() + geom_errorbar(aes(ymin=lower.CL, ymax=upper.CL), width=0.4) + labs(title="Dark-light difference, distance", x ="Offset (h)", y = "distance moved, dark - light (cm)") + geom_hline(yintercept=0) + theme(text=element_text(size=14))
+dev.off()
+
+##this is the ratio with CI calclated by Fieller method (https://stats.stackexchange.com/questions/16349/how-to-compute-the-confidence-interval-of-the-ratio-of-two-normal-means)
+
+FiellerRatioCI_basic <- function(a,b,V,alpha=0.05){
+    theta <- a/b
+    v11 <- V[1,1]
+    v12 <- V[1,2]
+    v22 <- V[2,2]
+
+    z <- qnorm(1-alpha/2)
+    g <- (z^2)*v22/b^2
+    C <- sqrt(v11 - 2*theta*v12 + theta^2 * v22 - g*(v11-v12^2/v22))
+    minS <- (1/(1-g))*(theta- g*v12/v22 - z/b * C)
+    maxS <- (1/(1-g))*(theta- g*v12/v22 + z/b * C)
+    return(c(ratio=theta,min=minS,max=maxS))
+}
+
+Fieller_emmeans <- function(model){
+   
+ V = vcov(model$emmeans)
+ rownames(V) <- paste0(c("Night", "Day"), rep(c(0,2,4,6,8,10,12), each=2))
+ colnames(V) <- paste0(c("Night", "Day"), rep(c(0,2,4,6,8,10,12), each=2))
+ 
+ ests = data.frame(model$emmeans)
+ rownames(ests) <- paste0(c("Night", "Day"), rep(c(0,2,4,6,8,10,12), each=2))
+ 
+ output <- data.frame(matrix(ncol = 4, nrow = 7))
+ colnames(output) <- c("Offset", "Ratio", "CI.L", "CI.R")
+ 
+ Offsets = seq(0, 12, 2)
+ 
+ for (i in 1:7){
+   sub_names = paste0(c("Night", "Day"), Offsets[i])
+   V_sub <- V[sub_names, sub_names]
+   
+   
+   a=ests[sub_names[1],]$emmean
+   b=ests[sub_names[2],]$emmean
+   
+   output[i,c(2:4)] <- FiellerRatioCI_basic(a,b,V_sub, alpha=0.05)
+   
+ }
+ 
+ output[,1] <- Offsets
+ 
+ return(output)
+}
+
+ratio_plot <- Fieller_emmeans(emm_activity)
+ 
+png(res=300, units='in', width=4, height=4, file="F:/circadian/plots/LD_ratio_activ.png")
+ggplot(ratio_plot, aes(x=Offset, y=1/Ratio)) + geom_point(color="black") + theme_bw() + geom_errorbar(aes(ymin=1/CI.L, ymax=1/CI.R), width=0.4) + labs(title="Dark-light activity ratio", x ="Offset (h)", y = "% time active dark - % time active light") + geom_hline(yintercept=1)
+dev.off() 
+
+ratio_plot <- Fieller_emmeans(emm_dist)
+
+png(res=300, units='in', width=4, height=4, file="F:/circadian/plots/LD_ratio_dist.png")
+ggplot(ratio_plot, aes(x=Offset, y=1/Ratio)) + geom_point(color="black") + theme_bw() + geom_errorbar(aes(ymin=1/CI.L, ymax=1/CI.R), width=0.4) + labs(title="Dark-light distance ratio", x ="Offset (h)", y = "distance moved dark / distance moved light (cm)") + geom_hline(yintercept=1)
+dev.off()
+
+
+
+```
+
+
+
+One final section with the activity data. Using the "rethomics" framework and "damr" package, we can make some pretty figures 
+```{r}
+
+smooth_fun = function(j){
+  smooth = cma(y=as.numeric(j) , order=4)
+  return(smooth$fitted)
+}
+
+
+df <- df %>% group_by(ID) %>% mutate(smoothed = smooth_fun(Normalized_filtered_movement))
+df = data.table(df, key = "ID")
+
+
+metadata$Condition = factor(metadata$Condition, levels = c("cycle", "constant", "cycle_mean", "constant_mean"), labels = c("Cycle", "Free-run", "Cycle", "Free-run"))
+metadata$Offset <- factor(metadata$Offset, levels=c("ZT0", "ZT2", "ZT4", "ZT6", "ZT8", "ZT10", "ZT12"), labels=c("Aligned", "2h", "4h", "6h", "8h", "10h", "12h"))
+
+dt = behavr(df, metadata)
+dt$t = dt$bin * 3600
+
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = interaction(ID, Offset, Condition, sep = " : "), z=smoothed)) +
+  stat_tile_etho()
+
+#to group, change Y axis
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x = t, y = interaction(Offset, Condition, sep = " : "), z=smoothed)) +
+  stat_tile_etho() + stat_ld_annotations() + ggetho::scale_x_hours()
+
+pl
+
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = interaction(Offset, Condition, sep = " : "), z=smoothed)) +
+  stat_bar_tile_etho() + stat_ld_annotations()
+
+
+
+png(file="Mean_plot_overlay.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_pop_etho() + stat_ld_annotations() +
+  facet_grid(Offset ~ .) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+png(file="Mean_bars_indiv.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA) + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+png(file="F:/circadian/plots/Fig_Behavior/Mean_indiv.png", res=600, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations() + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+png(file="Mean_indivs_minimal.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_minimal()
+dev.off()
+
+png(file="Mean_day_plot.png", res=300, units="in", width=4, height=4)
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+   facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA) + stat_pop_etho() + theme_bw()
+pl
+dev.off()
+
+png(file="Mean_day_Split.png", res=300, units="in", width=4, height=4)
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+   stat_ld_annotations(height=1, alpha=0.3, outline=NA) + facet_grid(Offset ~ Condition) + stat_pop_etho() + theme_bw()
+pl
+dev.off()
+
+#just to illustrate: 
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations() + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+#Speed doesn't seem to vary in any consistent way. Baseline differences across groups are probably just due to body size, etc. It's why we normalize.
+
+#for "sig" individuals...
+
+sig = metadata[p_24_BD2 < 0.001,]
+df_sig = df[df$ID %in% sig$ID,]
+dt = behavr(df_sig, sig)
+dt$t = dt$bin * 3600
+
+
+png(file="Mean_plot_smooth_sig", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+ stat_pop_etho() + stat_ld_annotations() +
+  facet_grid(Offset ~ .) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+
+png(file="Mean_sig_bars_indiv.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA) + stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+png(file="Mean_sig_indiv.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations() + stat_pop_etho() +
+  facet_grid(dt$Offset ~ Condition) + ggetho::scale_x_hours() + theme_bw()
+dev.off()
+
+png(file="Mean_indivs_minimal_sig.png", res=300, units="in", width=8, height=8)
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_pop_etho() +
+  facet_grid(Offset ~ Condition) + ggetho::scale_x_hours() + theme_minimal()
+dev.off()
+
+png(file="Mean_day_plot_sig.png", res=300, units="in", width=4, height=4)
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA) + stat_pop_etho() + theme_bw()
+pl
+dev.off()
+
+png(file="Mean_day_plot_sig_split.png", res=300, units="in", width=4, height=4)
+pl <- ggetho(dt, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA) + facet_grid(Offset ~ Condition) + stat_pop_etho() + theme_bw()
+pl
+dev.off()
+
+##while we're at it, let's briefly re-calculate the mean series from just the sig. individuals (we can see that the data are less noisy, which is expected)
+
+sig_df <- read.csv("Sig_datasheet.csv")
+
+
+##applies centered moving average of order 4
+smoothed = apply(sig_df, 1, function(j){
+  
+  dat = j[-c(1,2,3)]
+  
+  NAs = is.na(dat)
+  
+  smooth = cma(y=as.numeric(t(dat[!(NAs)]) ) , order=4)
+  
+  dat[!(NAs)] = smooth$fitted
+  
+  return(dat)
+})
+
+colnames(smoothed) = sig_df$ID
+
+write.csv(t(smoothed), file="Sig_smoothed.csv")
+
+#just means
+smoothed <- smoothed[,grepl("mean", colnames(smoothed))]
+
+rando_smooth_circ = apply(smoothed, 2, function(j, n=2000){
+  tmp = randlsp(repeats = n, x=as.numeric(j), type="period", ofac=50, from = 20, to=28, plot=FALSE, trace=FALSE)
+  return(summary(tmp))
+})
+
+
+# perm is number of permutations done above
+p_lsp_fun <- function(x, perm=2000){
+  ps = as.numeric(lapply(x, function(i){return(i$Value[13])}))
+  power = as.numeric(lapply(x, function(i){return(i$Value[9])}))
+  period = as.numeric(lapply(x, function(i){return(i$Value[10])}))
+  
+  #correct p-value from lsp by adding 1/500 (or whatever)
+  p_correct = ( (ps*perm)+1 ) / (perm+1)
+  
+  print(paste0( length(which(p_correct < 0.01)), " unadjusted p-values < 0.01"))
+  
+  p_adjust = p.adjust(p_correct, method = "BH")
+  print(paste0( length(which(p_adjust < 0.01)), " adjusted p-values < 0.01"))
+  print(paste0( length(which(p_adjust < 0.005)), " adjusted p-values < 0.005"))
+ 
+  return(cbind(p_adjust, power, period))
+}
+
+
+p1 = p_lsp_fun(rando_smooth_circ, perm=2000)
+
+rownames(p1) <- colnames(smoothed)
+
+
+```
+
+Quick little investigation of circatidal components:
+```{r}
+
+#ZT6 is the only average time series that may have a circatidal component: p=0.006, power = 0.35, and power = 0.22 for free_run. 
+#no individual had tidal p < 0.001, but if we relax this:
+n_sig = sapply(groups, function(g){
+  n = nrow(metadata[p_tidal < 0.01 & Group == g, ])
+  return(n / nrow(metadata[Group ==g,]))
+})
+n_sig
+
+##tidal power!
+
+#although ZT6_cycle had a decent circatidal componnet, it's circadian component was stronger (0.6 vs. 0.35). However, ZT6_free had a STRONGER circatidal component than circadian (circadian was not sig.). Techincally ZT10_free also had a stronger tidal, but neither was close to significance. 
+
+#tidal
+tidal <- no_means[which(no_means$p_tidal < 0.01),]
+
+#both (circatidal and circadian). No pattern to groups. Does include ZT6_cycle. 
+both <- tidal[tidal$p_24_BD2 < 0.001,]
+
+#animals with stronger tidal than circadian
+tidal <- no_means[which(no_means$power_tidal >= no_means$power_28 & no_means$p_tidal < 0.1),]
+#57 
+
+table(tidal$Group)
+#8 in 6_cyc, 10/36 in 12_cyc, just 1 in 0_cyc
+
+#All righty. Let's see if circatidal power varies among groups. 
+ggplot(means, aes(x = Offset, y = power_tidal, fill=Condition))+ geom_col(position="dodge")
+#ZT6 is pretty striking here. 
+
+
+ggplot(no_means, aes(x = Offset, y = power_tidal, color=Condition))+ geom_point() + geom_smooth(aes(group=Condition), method='lm') + facet_grid(.~Condition)
+#no linear trend, but there is a little bump at ZT6. 
+
+ggplot(no_means, aes(x = power_28, y = power_tidal, color=Offset))+ geom_point() + geom_smooth(aes(group=Condition), method='lm') + facet_grid(.~Condition)
+
+cor.test(no_means$power_28, no_means$power_tidal)
+#there is a signifcant negative correlation... 
+
+cor.test(no_means[no_means$Condition=="Cycle",]$power_28, no_means[no_means$Condition=="Cycle",]$power_tidal)
+cor.test(no_means[no_means$Condition=="Free-run",]$power_28, no_means[no_means$Condition=="Free-run",]$power_tidal)
+
+k = kruskal.test(power_tidal ~ Group, data = no_means)
+#p=0.07, so at best a marginal difference.
+
+#I'm only interested in comparing to the control, so I will only use those comparisons and adjust the p-values myself.
+DT <- dunnTest(power_tidal ~ Group, no_means)
+
+Align_comparisons <- DT$res[grepl("ZT0", DT$res$Comparison),]
+
+#and just ones that are comparing Cycle to cycle or constant to constant
+Align_comparisons <- Align_comparisons[c(2,5,6,9,10,13,14,17,18,21,22,25),]
+
+Align_comparisons$P.adj <- p.adjust(Align_comparisons$P.unadj, method="BH")
+#there are no statistically significant differences, after multiple test correction
+
+no_means$SC <- as.numeric(sub("..", "", no_means$Offset))
+
+res <- lm(power_tidal ~ SC, data=no_means[no_means$Condition=="Cycle",])
+summary(res)
+#p = 0.6
+
+res <- lm(power_tidal ~ SC, data=no_means[no_means$Condition=="Free-run",])
+summary(res)
+#p=1
+
+```
+
+We can visualize and quantify similarities between time series.
+```{r}
+library(factoextra)
+library(FactoMineR)
+library(biwavelet)
+library(ggrepel)
+library(pvclust)
+
+#First, use smoothed data and decompose into wavelets (frequency spectra)
+smooth <- read.csv("smoothed.csv")
+
+just_means = smooth[grepl("mean", smooth$X),]
+rownames(just_means) = c("Align_C", "Align_FR", "Off6_C", "Off6_FR", "Off12_C","Off12_FR",  "Off10_C", "Off10_FR","Off4_C", "Off4_FR", "Off2_C", "Off2_FR", "Off8_C", "Off8_FR")
+
+#We'll cut the first 6 time points because these are NA for free-running
+df <- data.frame( t(just_means[,-c(1:7)]) )
+df$time <- seq(12,83)
+
+#which time column
+time=ncol(df)
+
+#scan for periods (scales) between 2 and 36
+wave_fun <- function(x){
+  wave <- wt(df[,c(time,x)], s0=2, max.scale = 36)
+  return(wave)
+}
+
+w.arr=array(NA, dim=c(ncol(df)-1, 51, 72))
+
+for (n in 1:nrow(w.arr)){
+  w.arr[n,,] <- wave_fun(n)$wave
+}
+
+# Compute dissimilarity and distance matrices
+w.arr.dis=wclust(w.arr)
+
+my_data <- as.matrix(w.arr.dis$dist.mat)
+
+rownames(my_data) <- names(df)[1:14]
+colnames(my_data) <- names(df)[1:14]
+
+#retain 100 principal components (just to get all of them)
+res.pca <- PCA(my_data, ncp = 100, graph = FALSE)
+
+# Compute hierarchical clustering on principal components. 
+res.hcpc <- HCPC(res.pca, graph = TRUE, method="complete", nb.clust = 4)
+#looking at the graph there are 4 clear clusters, so we can cut there
+
+#Note that using Ward linkage gives similar results
+
+res.pv <- pvclust(t(res.pca$ind$coord), method.hclust="complete",
+method.dist="euclidean", nboot=2000)
+
+plot(res.pv, hang = -1, cex = 0.5)
+pvrect(res.pv, alpha=0.9)
+
+cols = c("#31688EFF", "#35B779FF", "#440154FF", "grey40")
+
+tiff(filename = "F:/circadian/plots/HCPC_dendrogram.tiff", res=400, units='in', height=7, width=7)
+fviz_dend(res.hcpc, 
+          cex = 1,              
+          palette = "black",            
+          rect = TRUE, rect_fill = TRUE, rect_lty = 1,
+          rect_border = cols,
+          labels_track_height = 0.5,
+          main="Cluster dendrogram of mean behavior profiles"
+          
+          )
+dev.off()
+
+tiff(filename = "F:/circadian/plots/HCPC_PCA.tiff", res=400, units='in', height=7, width=7)
+p <- fviz_cluster(res.hcpc,
+             repel = TRUE,  geom="point", pointsize=3, labelsize=18,   
+             show.clust.cent = FALSE, 
+             
+             palette = cols[c(2,4,3,1)], 
+             ggtheme = theme_minimal(),
+             main = "PCA of mean behavior profiles"
+          
+             ) 
+p + geom_text_repel(data=p$data, aes(x=x, y=y, label=name, colour=cluster), show.legend = F)
+dev.off()
+
+tiff(filename = "F:/circadian/plots/HCPC_3D60.tiff", res=400, units='in', height=7, width=7)
+palette(cols[c(2,4,3,1)])
+plot(res.hcpc, choice = "3D.map", angle=60, ind.names=F)
+dev.off()
+
+
+##If we do clustering directly on the data (not the PCA)...
+
+hc <- hclust(w.arr.dis$dist.mat,  method="complete")
+#looking at the graph there are 4 clear clusters, so we can cut there
+
+fviz_dend(hc, 
+          cex = 1,              
+          palette = "black",            
+          rect = TRUE, rect_fill = TRUE, rect_lty = 1,
+          rect_border = cols,
+          labels_track_height = 0.5,
+          main="Cluster dendrogram of mean behavior profiles"
+          
+          )
+
+
+fviz_cluster(hc,
+             repel = TRUE,            # Avoid label overlapping
+             show.clust.cent = FALSE, # Show cluster centers
+             palette = "jco",         # Color palette see ?ggpubr::ggpar
+             ggtheme = theme_minimal(),
+             main = "Factor map"
+             )
+
+plot(res.hcpc, choice = "3D.map", angle=45)
+
+####example wavelet for ZT0_cycle
+x=1
+ wave0 <- wt(df[,c(time,x)], s0=2, max.scale=36)
+ 
+ plot(wave0, type = "power.corr.norm", main = "Bias-corrected wavelet power")
+ 
+ #so you can see that the dominant period for the entire series is around 24h.
+ 
+ x=5
+ wave12 <- wt(df[!is.na(df[,x]),c(time,x)],s0=2, max.scale = 36)
+ 
+ par(mfrow = c(1,2))
+ plot(wave0, type = "power.corr.norm", main = "ZT0_cycle")
+ plot(wave12, type = "power.corr.norm", main = "ZT12_cycle")
+ 
+#whereas the ZT12_cycle series is wonky, and has some dominant high-frequency components, albeit still some circadian signal
+
+ #it's also interesting to plot wavelets: we can see the peaks and troughs.
+par(mfrow = c(1,2))
+ plot(wave0, type = "wavelet", main = "ZT0_cycle")
+ plot(wave12, type = "wavelet", main = "ZT12_cycle")
+ 
+ all_waves <- sapply(1:14, wave_fun)
+ 
+ colnames(all_waves) = names(df)[1:14]
+ 
+ 
+sapply(names(df)[1:14], function(name){
+  png(file=paste0(name, "_BIwavelet.png"), res=300, height=4, width=8, units = 'in')
+  
+  par(mfrow = c(1,2))
+  
+  tmp <- all_waves[,name]
+  class(tmp) <- "biwavelet"
+
+   plot(tmp, type = "power.corr.norm", main = name)
+ plot(tmp, type = "wavelet", main = "Wavelets")
+  
+  dev.off()
+  
+  
+})
+ 
+```
+
+```{r}
+###
+metadata = read.csv("metadata_conflict.csv")
+metadata = data.table(metadata, key="ID")
+
+metadata$circ = as.circular(metadata$MFF_phase_28, units = "hours", rotation="clock")
+
+dim(metadata)
+no_mean = metadata[1:348,]
+
+metadata$Offset = as.numeric( sub('..', '', metadata$Offset) )
+mean_phases = metadata %>% filter(grepl("mean", Group)) %>% select(ID, Condition, Offset, MFF_phase_28, FFT_phase, p_24_BD2)
+
+mean_phases$sig = mean_phases$p_24_BD2 < 0.001
+mean_phases$Condition = factor(mean_phases$Condition, levels=c("cycle_mean", "constant_mean"), labels=c("Cycle", "Free-run"))
+
+p <- ggplot(mean_phases, aes(x = Offset, y = MFF_phase_28, color = Condition, fill = factor(ifelse(!sig, NA, Condition)))) +
+    geom_point(size = 4, shape=21) + scale_fill_discrete(na.value=NA, guide="none")
+
+p <- p + geom_hline(yintercept = 18, color="goldenrod1", size=1.5) + theme_bw()
+
+p <- p + geom_abline(slope = 1, intercept = 18, color="coral3", size=1) + geom_abline(slope = 1, intercept = -6, color="coral3", size=1)
+
+p <- p + scale_y_continuous(breaks = seq(0, 24, by = 4), labels = seq(0, 24, by = 4)) + scale_x_continuous(breaks = seq(0, 12, 2), labels = seq(0, 12, 2)) + ggtitle("Phase relationships of average activity profiles")
+
+png(res=300, units='in', height=4, width=4, file="F:/circadian/plots/Phase_shifts_mean.png")
+p + geom_abline(slope = 1, intercept = 22, color="salmon", size=1) + geom_abline(slope = 1, intercept = -2, color="salmon", size=1)
+dev.off()
+
+#means of rhythmic individuals
+
+sig = no_mean %>% filter(p_24_BD2 < 0.001)
+
+sig = sig %>% group_by(Group) %>% mutate(group_phase = mean(circ), phase_SE = sd.circular(circ))
+
+tmp = unique(select(sig, Group, group_phase, phase_SE))
+
+mean_phases$sig_phase = tmp$group_phase[order(tmp$Group)] %% 24
+mean_phases$SE = tmp$phase_SE[order(tmp$Group)]
+
+q <- ggplot(mean_phases, aes(x = Offset, y = sig_phase, color = Condition)) + geom_hline(yintercept = 18, color="black", size=1.25) + theme_bw()
+
+
+q <- q + geom_abline(slope = 1, intercept = 18, color="grey", size=1) + geom_abline(slope = 1, intercept = -6, color="grey", size=1)
+
+q <- q + geom_abline(slope = 1, intercept = 22, color="grey", size=1) + geom_abline(slope = 1, intercept = -2, color="grey", size=1)
+
+q <- q + geom_point(size = 4) + geom_errorbar(aes(ymax = sig_phase + 1.96*SE, ymin = sig_phase - 1.96*SE), alpha=0.65, width=0.2, size=1)
+
+png(res=600, units='in', height=4, width=4, file="F:/circadian/plots/Fig_Behavior/Phase_shifts_sig_grey.png")
+q + scale_y_continuous(breaks = seq(0, 24, by = 4), labels = seq(0, 24, by = 4)) + scale_x_continuous(breaks = seq(0, 12, 2), labels = seq(0, 12, 2)) + ggtitle("Phase relationships of rhythmic individuals") + ylab("Phase")
+dev.off()
+
+
+##quantify this. 
+#distance to "light"
+sig$dist_to_light = sig$circ - 18
+sig$dist_to_light[sig$dist_to_light>12] = 24 - sig$dist_to_light[sig$dist_to_light>12]
+sig$dist_to_light[sig$dist_to_light < -12] = sig$dist_to_light[sig$dist_to_light< -12] + 24
+
+sig$dist_to_temp = sig$circ - (18 + as.numeric(sub("..", "", sig$Offset)) )%%24
+sig$dist_to_temp[sig$dist_to_temp>12] = 24 - sig$dist_to_temp[sig$dist_to_temp>12]
+sig$dist_to_temp[sig$dist_to_temp < -12] = sig$dist_to_temp[sig$dist_to_temp< -12] + 24
+
+sig$dist_to_temp22 = sig$circ - (22 + as.numeric(sub("..", "", sig$Offset)) )%%24
+sig$dist_to_temp22[sig$dist_to_temp22>12] = 24 - sig$dist_to_temp22[sig$dist_to_temp22>12]
+sig$dist_to_temp22[sig$dist_to_temp22 < -12] = sig$dist_to_temp22[sig$dist_to_temp22< -12] + 24
+
+#if positive, closer to temp, if negative, closer to light
+sig$delta_delta = sig$dist_to_light - sig$dist_to_temp
+
+sig$dist_to_light = abs(sig$dist_to_light)
+sig$dist_to_temp = abs(sig$dist_to_temp)
+sig$dist_to_temp22 = abs(sig$dist_to_temp22)
+
+ggplot(sig, aes(x=Offset, y=dist_to_light, color=Condition)) + geom_point() + theme_bw() + facet_grid(.~Condition)
+ggplot(sig, aes(x=Offset, y=dist_to_temp, color=Condition)) + geom_point() + theme_bw() + facet_grid(.~Condition)
+ggplot(sig, aes(x=Offset, y=delta_delta, color=Condition)) + geom_point() + theme_bw() + facet_grid(.~Condition)
+
+kruskal.test(dist_to_light ~ Offset, data = sig[sig$Condition=="cycle",])
+#abs p = 0.034
+kruskal.test(dist_to_temp ~ Offset, data = sig[sig$Condition=="cycle",])
+#abs p = 3.4e-8
+kruskal.test(dist_to_temp22 ~ Offset, data = sig[sig$Condition=="cycle",])
+#abs p = 2.8e-5
+kruskal.test(delta_delta ~ Offset, data = sig[sig$Condition=="cycle",])
+#abs p = 2.8e-4
+#22 p=0.0003
+
+kruskal.test(dist_to_light ~ Offset, data = sig[sig$Condition=="constant",])
+kruskal.test(dist_to_temp ~ Offset, data = sig[sig$Condition=="constant",])
+kruskal.test(dist_to_temp22 ~ Offset, data = sig[sig$Condition=="constant",])
+kruskal.test(delta_delta ~ Offset, data = sig[sig$Condition=="constant",])
+#none of these are sig
+
+wilcox.test(sig[sig$Condition=="cycle" & sig$Offset=="ZT12",]$dist_to_light, sig[sig$Condition=="cycle" & sig$Offset=="ZT12",]$dist_to_temp, paired=TRUE)
+#paired: 0.3917, 0.006359, p=0.2774, 0.004098, 0.04096, 0.7869
+
+p.adjust(c(0.3917, 0.006359, 0.2774, 0.004098, 0.04096, 0.7869), method="BH")
+
+
+wilcox.test(sig[sig$Condition=="cycle" & sig$Offset=="ZT0",]$dist_to_light, sig[sig$Condition=="cycle" & sig$Offset=="ZT0",]$dist_to_temp22, paired=TRUE)
+#0.05141, 0.000471, 0.00149, 0.0654,0.0003052,0.221 0.9441
+
+p.adjust(c(0.05141, 0.000471, 0.00149, 0.0654,0.0003052,0.221, 0.9441), method="BH")
+
+```
