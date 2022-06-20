@@ -1,0 +1,375 @@
+---
+title: "Compare TagSeq w/ Oren and Tarrant datasets"
+output: html_notebook
+---
+
+TagSeq reads were quantified against the Nematostella genome at SIMRBase (https://genomes.stowers.org/starletseaanemone) (Nvec200_v1) with Salmon v1.5.1. 
+
+First, load in the data. 
+
+```{r warning=FALSE, message=FALSE}
+setwd("F:/circadian/Tag_Seq/")
+
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(viridis)
+library(tximport)
+library(readr)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(DESeq2)
+library(stringr)
+library(circular)
+library(data.table)
+
+results_align = read.csv("Align_RAIN.csv")
+results_offset = read.csv("Offset_RAIN.csv")
+
+rownames(results_align) = results_align$Gene
+sig_Align = results_align[results_align$pVal < 0.01,]
+rownames(results_offset) = results_offset$Gene
+sig_Offset = results_offset[results_offset$pVal < 0.01,]
+
+shared = sig_Align$Gene[sig_Align$Gene %in% sig_Offset$Gene]
+
+sig_Offset$circ <- as.circular(sig_Offset$Circa_phase, units = "hours", rotation="clock")
+sig_Align$circ <- as.circular(sig_Align$Circa_phase, units = "hours", rotation="clock")
+
+
+```
+
+
+Oren et al. (2015) sampled every 4 for 48h over an LD cycle at constant T (23C), beginning at ZT1. Only 1 bio replicate at most time points, so there is much less power to detect rhythmicity than in our own dataset. Still, it provides a reference for an LD cycle with a temperature cycle. Also, different population (MD vs. MA)
+
+
+Read in the data and use RAIN (takes some time)
+```{r warning=FALSE, eval=FALSE}
+
+library(rain)
+library(circacompare)
+setwd("F:/circadian/Compare/")
+
+df = read.csv("TMM_Oren.csv", header=TRUE)
+rownames(df) = df$X
+df=df[,-1]
+
+results_Oren <- rain(t(df), deltat=4, period=24, measure.sequence=c(1,2,1,1,1,1,1,1,1,2,1,1),
+                peak.border=c(0.15, 0.85), verbose=TRUE, adjp.method = "Bonferroni")
+
+results_Oren$Gene = rownames(results_Oren)
+
+length(which(results_Oren$pVal < 0.05))
+#1498
+length(which(results_Oren$pVal < 0.01))
+#566 
+
+#I'm using a different p-value cutoff for Oren because of its smaller sample size. It's not possible (w/o rarefaction) to directly compare the number of rhythmic features anyway, so this is just a way of exploring the data.
+sig_Oren = results_Oren[results_Oren$pVal < 0.05,]
+
+###The phase output here isn't right because it doesn't know the sampling times, but we won't be using it anyway.
+
+#what are the phase distributions of these genes?
+names(df) = paste0("ZT", c(1, 5, 5, 9, 13, 17, 21, 25, 29, 33, 37, 37, 41, 45) )
+
+circ_comp_phase <- function(gene){
+  
+  a = melt( as.data.table( df[gene,] ) )
+  a$variable = as.numeric( sub('..', '', a$variable) )
+  
+  res = circa_single(a, col_time="variable", col_outcome="value", period=24, alpha_threshold = 0.5)
+ 
+  #amplitude dif est, p-value
+  return( res$summary$value[5] )
+  
+}
+
+phase_test = sapply(sig_Oren$Gene, circ_comp_phase)
+
+results_Oren$Circa_phase = NA
+results_Oren[sig_Oren$Gene,]$Circa_phase = phase_test
+
+ggplot(results_Oren[results_Oren$pVal < 0.05,], aes(x=Circa_phase)) + geom_histogram(binwidth=1) + theme_bw() + xlim(c(0,24))
+#as in our own dataset, the phase distribution is bimodal: peaks around ZT4 and ZT16
+
+write.csv(results_Oren, file="RAIN_Oren.csv")
+```
+
+
+##Start here to load in the results from the above chunk...
+```{r}
+results_Oren <- read.csv("F:/circadian/Compare/RAIN_Oren.csv")
+sig_Oren <- results_Oren[results_Oren$pVal < 0.05,]
+
+```
+
+##Let's try some GO enrichment of these re-analyzed datasets.
+```{r warning=FALSE, eval=FALSE}
+library(data.table)
+setwd("F:/circadian/Compare/GO")
+
+goAnnotations="Nvec_GO.txt" 
+goDatabase="go.obo"
+source("gomwu.functions.R")
+
+#Runs GO MWU (Fisher's exact test) for all circadian/rhythmic genes. 
+my_go_fun <- function(input, pvalue){
+    base <- basename( tools::file_path_sans_ext(input) )
+  
+    DE_res = read.csv(input)
+    
+    DE_res$sig = 0
+    
+    DE_res[DE_res$pVal < pvalue,]$sig = 1
+    
+    DE_sig = DE_res[ , c(1,8)]
+    
+    write.csv(DE_sig, file=paste0(base, "_for_MWU.csv"), row.names = F, quote=F)
+
+    go_divs = c("BP", "MF", "CC")
+    
+    input = paste0(base, "_for_MWU.csv")
+    
+    lapply(go_divs, function(x){
+      gomwuStats(input, goDatabase, goAnnotations, x,
+                 perlPath="perl", 
+                 largest=0.1,
+                 smallest=5,
+                 clusterCutHeight=0.25
+                 #Module=TRUE,Alternative="g"
+      )
+      
+      mwu_table <- paste("MWU_", x, "_", input, sep="")
+      
+      if (is.na (sum(read.table(mwu_table, header=T)$p.adj < 0.1) > 1)){
+        } else  if (sum(read.table(mwu_table, header=T)$p.adj < 0.1) > 1){
+    
+          results=gomwuPlot(input,goAnnotations,x,
+                        
+                       absValue=0.001,
+                       level1=0.1,
+                       level2=0.05,
+                       level3=0.01,
+                       txtsize=1.4,
+                       treeHeight=2.0,
+                       colors=c("firebrick1", "lightcoral")) 
+      
+          write.csv(results[[1]], file=paste(base,"_",x,".csv", sep=''))
+          dev.off()
+      
+          png(paste(base,"_sig_", x, ".png", sep=''))
+          results=gomwuPlot(input,goAnnotations,x,
+                        absValue=0.001,
+                        level1=0.1,
+                        level2=0.05,
+                        level3=0.01,
+                        txtsize=1.4,
+                        treeHeight=2.0,
+                        colors=c("firebrick1", "lightcoral") 
+          )
+          dev.off()
+      }
+    })
+  
+    
+}
+
+my_go_fun("F:/circadian/Compare/RAIN_Oren.csv", pvalue=0.05)
+#no GO terms
+
+#but more informative to break this down by phase. I divide the day into 4 6-h chunks...
+
+my_go_fun_PHASE <- function(input, pvalue){
+    base <- basename( tools::file_path_sans_ext(input) )
+  
+    DE_res = read.csv(input)
+    
+    DE_res$sig = 0
+    
+    for (i in 0:3) {
+      DE_res$sig = 0
+      
+      DE_res[DE_res$pVal < pvalue & DE_res$Circa_phase %between% c(0+6*i,6*(i+1)),]$sig = 1
+   
+      DE_sig = DE_res[ , c(1,8)]
+    
+      write.csv(DE_sig, file=paste0(base, "_", i*6, "_PHASE.csv"), row.names = F, quote=F)
+
+    go_divs = c("BP", "MF", "CC")
+    
+    input = paste0(base, "_", i*6, "_PHASE.csv")
+    
+    lapply(go_divs, function(x){
+      gomwuStats(input, goDatabase, goAnnotations, x,
+                 perlPath="perl", 
+                 largest=0.1,
+                 smallest=5,
+                 clusterCutHeight=0.25
+                 #Module=TRUE,Alternative="g"
+      )
+      
+      mwu_table <- paste("MWU_", x, "_", input, sep="")
+      
+      if (is.na (sum(read.table(mwu_table, header=T)$p.adj < 0.1) > 1)){
+        } else  if (sum(read.table(mwu_table, header=T)$p.adj < 0.1) > 1){
+    
+          results=gomwuPlot(input,goAnnotations,x,
+                        
+                       absValue=0.001,
+                       level1=0.1,
+                       level2=0.05,
+                       level3=0.01,
+                       txtsize=1.4,
+                       treeHeight=2.0,
+                       colors=c("firebrick1", "lightcoral")) 
+      
+          write.csv(results[[1]], file=paste(base,"_", i*6, "_PHASE_", x,".csv", sep=''))
+          dev.off()
+      
+          png(paste(base,"_", i*6, "_PHASE_", x, ".png", sep=''))
+          results=gomwuPlot(input,goAnnotations,x,
+                        absValue=0.001,
+                        level1=0.1,
+                        level2=0.05,
+                        level3=0.01,
+                        txtsize=1.4,
+                        treeHeight=2.0,
+                        colors=c("firebrick1", "lightcoral") 
+          )
+          dev.off()
+      }
+    })
+    
+    }
+  
+    
+}
+
+my_go_fun_PHASE("F:/circadian/Compare/RAIN_Oren.csv", pvalue=0.05)
+#phases 12-18: ATP binding, microtubule motor activity, unfolded protein binding, ligase activity, forming carbon-oxygen bonds, motor activity. Sort of like Green module under Align.
+
+```
+
+
+Let's use KEGG pathways to get even more information. 
+```{r}
+setwd("F:/circadian/Compare/KEGG")
+library(clusterProfiler)
+library(stringr)
+library(data.table)
+
+all_genes = results_align$Gene
+
+df <- read.table("KEGG_annots.txt")
+
+other_genes = data.frame("None", all_genes[ ! all_genes %in% df$V2])
+df = rbind(df, other_genes, use.names = FALSE)
+
+#just uses a hypergeometric test. This function uses a "for_MWU" file produced by the GO functions above.
+kegg_fun <- function(file, name){
+  temp = read.csv(file)
+  
+  res = enricher(gene = temp[temp$sig == 1, 1], minGSSize = 5, TERM2GENE = df)
+ 
+  n = length(which(res@result$p.adjust < 0.05))
+  
+  head(res@result, n)$ID
+  
+  write.csv( res@result[,c("ID", "GeneRatio", "BgRatio", "p.adjust")], file=paste0(name, "_KEGG.csv"))
+  
+}
+
+kegg_fun("F:/circadian/Compare/GO/Results_Oren/RAIN_Oren_for_MWU.csv", name="Oren_all")
+kegg_fun("F:/circadian/Compare/GO/Results_Oren/RAIN_Oren_0_PHASE.csv", name="Oren_0")
+kegg_fun("F:/circadian/Compare/GO/Results_Oren/RAIN_Oren_6_PHASE.csv", name="Oren_6")
+kegg_fun("F:/circadian/Compare/GO/Results_Oren/RAIN_Oren_12_PHASE.csv", name="Oren_12")
+#Protein processesing in ER, spliceosome
+kegg_fun("F:/circadian/Compare/GO/Results_Oren/RAIN_Oren_18_PHASE.csv", name="Oren_18")
+#Nothing anywhere else.
+
+
+
+
+```
+
+
+```{r}
+only_Oren = sig_Oren[!rownames(sig_Oren) %in% sig_Align$Gene,]
+
+summary(rownames(sig_Oren) %in% results_align[results_align$pVal < 0.05,]$Gene)
+summary(rownames(sig_Oren) %in% results_offset[results_offset$pVal < 0.05,]$Gene)
+#345 genes were shared with align, 283 with SC
+#or 477 and 425 with p < 0.05
+
+shared = rownames(sig_Oren)[rownames(sig_Oren) %in% results_align[results_align$pVal < 0.05,]$Gene]
+
+ggplot(results_Oren[shared,], aes(x=Circa_phase)) + geom_histogram(binwidth=1) + theme_bw() + xlim(c(0,24))
+ggplot(results_align[results_align$Gene %in% shared,], aes(x=Circa_phase)) + geom_histogram(binwidth=1) + theme_bw() + xlim(c(0,24))
+
+hist(results_Oren[shared,]$Circa_phase - results_align[results_align$Gene %in% shared,]$Circa_phase)
+
+
+#let's compare the phases of genes in our dataset and Oren et al.
+df_Oren = df
+
+df = read.table("TMM_tagSeq.txt", header=TRUE)
+
+df_align = df[,1:39]
+names(df_align) = paste0("ZT", rep(c(6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54), each=3) )
+
+circ_comp_phase <- function(gene){
+  
+  a = melt( as.data.table( df_align[gene,] ) )
+  a$variable = as.numeric( sub('..', '', a$variable) )
+  
+  a$condition = "align"
+  
+  o = melt( as.data.table( df_Oren[gene,] ) )
+  o$variable = as.numeric( sub('..', '', o$variable) )
+  
+  o$condition = "Oren"
+  
+  df = rbind(a, o)
+  
+  res = circacompare(df, col_time="variable", col_outcome="value", col_group="condition", period=24, alpha_threshold = 1)
+ 
+  #amplitude dif est, p-value
+  return( res$summary$value[13:14] )
+  
+}
+
+phase_test = sapply(shared, circ_comp_phase)
+
+phases = data.frame( t(phase_test) )
+names(phases) = c("Dif", "p")
+phases$padj = p.adjust(phases$p, method="BH")
+
+length(which(phases$padj < 0.01))
+#108 / 345
+#137 / 477
+length(which(phases$padj < 0.05))
+#146
+
+phases[genes$V1,]
+
+length(which(abs(phases$Dif) < 4))
+#224
+length(which(abs(phases$Dif) >= 6))
+#172
+length(which(abs(phases$Dif) >= 8))
+#108
+length(which(abs(phases$Dif) >= 10))
+#52
+
+hist(phases$Dif)
+
+write.csv(phases, file="Oren_phases_offset.csv", quote =F)
+
+
+```
+
+
+
