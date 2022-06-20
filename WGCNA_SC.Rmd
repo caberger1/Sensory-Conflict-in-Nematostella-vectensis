@@ -1,0 +1,1703 @@
+---
+title: "Sensory Conflict WGCNA analysis"
+output: html_notebook
+
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+TagSeq reads were quantified against the Nematostella genome at SIMRBase (https://genomes.stowers.org/starletseaanemone) (Nvec200_v1) with Salmon v1.5.1. 
+
+First, load in the data. 
+
+```{r, warning=FALSE, message=FALSE}
+setwd("F:/circadian/Tag_Seq/")
+
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(viridis)
+library(tximport)
+library(readr)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(DESeq2)
+library(stringr)
+library(circular)
+library(data.table)
+library(WGCNA)
+library(psych)
+library(lomb)
+library(clusterProfiler)
+
+load("txi_counts.Rdata")
+
+y <- DGEList(txi$counts)
+
+#rename the libraries
+row.names(y$samples) <- gsub(".*-","", row.names(y$samples) )
+row.names(y$samples) <- gsub("_.*","", row.names(y$samples) )
+colnames(y$counts) <- gsub(".*-","", colnames(y$counts) ) 
+colnames(y$counts) <- gsub("_.*","", colnames(y$counts) )
+
+#re-order
+y$counts <- y$counts[,order(colnames(y$counts))]
+
+design <- read.csv("SC_design.csv", row.names = 1)
+
+TMM <- calcNormFactors(y, method='TMM')
+cpms <- cpm(TMM, log = TRUE)
+#write.table(cpms, file="TMM_tagSeq.txt")
+
+
+```
+
+```{r}
+setwd("F:/circadian/Tag_Seq/")
+
+results_align = read.csv("Align_RAIN.csv")
+results_offset = read.csv("Offset_RAIN.csv")
+
+rownames(results_align) = results_align$Gene
+sig_Align = results_align[results_align$pVal < 0.01,]
+rownames(results_offset) = results_offset$Gene
+sig_Offset = results_offset[results_offset$pVal < 0.01,]
+
+shared = sig_Align$Gene[sig_Align$Gene %in% sig_Offset$Gene]
+
+Align_only = read.csv("only_Align_Strict.csv")
+Offset_only = read.csv("only_Offset_Strict.csv")
+
+sig_Offset$circ <- as.circular(sig_Offset$Circa_phase, units = "hours", rotation="clock")
+sig_Align$circ <- as.circular(sig_Align$Circa_phase, units = "hours", rotation="clock")
+```
+
+Clustering! Construct a network using genes rhythmic in at least one condition (n=4192). This chunk would take some time to run. I ran this on an HPC, and you can just start at a chunk further down to read in the data.
+```{r, warning=FALSE, eval=FALSE}
+#Let's start with our friend WGCNA
+
+disableWGCNAThreads()
+
+rhythmic = unique( c(sig_Align$Gene, sig_Offset$Gene) )
+
+length(rhythmic)
+#4192
+
+##WGCNA wants genes as columns
+dat_expr <- t(cpms[rhythmic,])
+
+#checks for missing entries and zero-variance genes
+gsg = goodSamplesGenes(dat_expr, verbose = 3);
+gsg$allOK
+#TRUE
+
+##Cluster samples to look for outliers
+sample_tree = hclust(dist(dat_expr), method = "average");
+plot(sample_tree, main = "Sample clustering to detect outliers", sub="", xlab='')
+
+## Choose soft thresholding exponent (for calculating adjacency)
+
+powers = c(c(1:10), seq(from=12, to = 20, by=2))
+
+sft <- pickSoftThreshold(dat_expr, powerVector=powers, verbose=5)
+
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n", main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, col="red");
+
+abline(h=0.90,col="red")
+
+soft_power = 5
+
+cor = WGCNA::cor
+
+## 
+
+net = blockwiseModules(dat_expr, maxBlockSize = 20000, corType = "bicor", maxPOutliers = 0.2, power = soft_power, networkType = "signed hybrid", TOMType = "signed", minModuleSize = 30, mergeCutHeight = 0.25, numericLabels = TRUE, pamRespectsDendro = FALSE, saveTOMs = FALSE, verbose = 3)
+
+merged_colors = labels2colors(net$colors)
+
+plotDendroAndColors(net$dendrograms[[1]], merged_colors[net$blockGenes[[1]]], "Module colors", dendroLabels = FALSE, hang=0.03, addGuide = TRUE, guideHang =0.05)
+#a lot fewer unassigned genes
+
+module_labels = net$colors
+module_colors = labels2colors(net$colors)
+MEs = net$MEs;
+gene_tree = net$dendrograms[[1]];
+
+save(MEs, module_labels, module_colors, gene_tree, file = "WGCNA_Circadian.RData")
+
+table(module_colors)
+#14 modules. 932 unassigned.
+
+#### Let's do just sig_Offset..
+
+length(sig_Offset$Gene)
+#2440
+
+##WGCNA wants genes as columns
+dat_expr <- t(cpms[sig_Offset$Gene,40:78])
+
+#checks for missing entries and zero-variance genes
+gsg = goodSamplesGenes(dat_expr, verbose = 3);
+gsg$allOK
+#TRUE
+
+##Cluster samples to look for outliers
+sample_tree = hclust(dist(dat_expr), method = "average");
+plot(sample_tree, main = "Sample clustering to detect outliers", sub="", xlab='')
+
+## Choose soft thresholding exponent (for calculating adjacency)
+
+powers = c(c(1:10), seq(from=12, to = 20, by=2))
+
+sft <- pickSoftThreshold(dat_expr, powerVector=powers, verbose=5)
+
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n", main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, col="red");
+
+abline(h=0.90,col="red")
+
+soft_power = 8
+
+cor = WGCNA::cor
+
+## 
+
+net = blockwiseModules(dat_expr, maxBlockSize = 20000, corType = "bicor", maxPOutliers = 0.2, power = soft_power, networkType = "signed hybrid", TOMType = "signed", minModuleSize = 30, mergeCutHeight = 0.25, numericLabels = TRUE, pamRespectsDendro = FALSE, saveTOMs = FALSE, verbose = 3)
+
+merged_colors = labels2colors(net$colors)
+
+plotDendroAndColors(net$dendrograms[[1]], merged_colors[net$blockGenes[[1]]], "Module colors", dendroLabels = FALSE, hang=0.03, addGuide = TRUE, guideHang =0.05)
+
+module_labels = net$colors
+module_colors = labels2colors(net$colors)
+MEs = net$MEs;
+gene_tree = net$dendrograms[[1]];
+
+save(MEs, module_labels, module_colors, gene_tree, file = "WGCNA_Offset.RData")
+
+#### Let's do just sig_Align..
+
+length(sig_Align$Gene)
+#2868
+
+##WGCNA wants genes as columns
+dat_expr <- t(cpms[sig_Align$Gene,1:39])
+
+#checks for missing entries and zero-variance genes
+gsg = goodSamplesGenes(dat_expr, verbose = 3);
+gsg$allOK
+#TRUE
+
+##Cluster samples to look for outliers
+sample_tree = hclust(dist(dat_expr), method = "average");
+plot(sample_tree, main = "Sample clustering to detect outliers", sub="", xlab='')
+
+## Choose soft thresholding exponent (for calculating adjacency)
+
+powers = c(c(1:10), seq(from=12, to = 20, by=2))
+
+sft <- pickSoftThreshold(dat_expr, powerVector=powers, verbose=5)
+
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n", main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, col="red");
+
+abline(h=0.90,col="red")
+
+soft_power = 8
+
+cor = WGCNA::cor
+
+## 
+
+net = blockwiseModules(dat_expr, maxBlockSize = 20000, corType = "bicor", maxPOutliers = 0.2, power = soft_power, networkType = "signed hybrid", TOMType = "signed", minModuleSize = 30, mergeCutHeight = 0.25, numericLabels = TRUE, pamRespectsDendro = FALSE, saveTOMs = FALSE, verbose = 3)
+
+merged_colors = labels2colors(net$colors)
+
+plotDendroAndColors(net$dendrograms[[1]], merged_colors[net$blockGenes[[1]]], "Module colors", dendroLabels = FALSE, hang=0.03, addGuide = TRUE, guideHang =0.05)
+
+module_labels = net$colors
+module_colors = labels2colors(net$colors)
+MEs = net$MEs;
+gene_tree = net$dendrograms[[1]];
+
+save(MEs, module_labels, module_colors, gene_tree, file = "WGCNA_Align.RData")
+
+```
+
+
+#parsing for GO
+```{r}
+
+print_for_mwu <- function(color){
+  module_genes = module_colors==color
+  
+  mod_genes <- data.frame(V1=rownames(gene_mod_membership))
+  mod_genes[,2] = 0
+  mod_genes[module_genes,2] = gene_mod_membership[module_genes, match(color, mod_names)]
+  
+  not_rhythmic <- all_genes[!(all_genes %in% mod_genes[,1])]
+  
+  mod_genes <- rbind(mod_genes, data.frame(V1=not_rhythmic, V2=0))
+  
+  write.csv(mod_genes, file=(paste(color, "_kMEs_ALL.csv", sep='')), row.names = FALSE, quote = FALSE)
+  
+}
+
+
+my_go_fun <- function(input){
+    base <- basename( tools::file_path_sans_ext(input) )
+    
+    input = basename(input)
+    
+    go_divs = c("BP", "MF", "CC")
+    
+    lapply(go_divs, function(x){
+      gomwuStats(input, goDatabase, goAnnotations, x,
+                 perlPath="perl", 
+                 largest=0.1,
+                 smallest=5,
+                 clusterCutHeight=0.25,
+                 Module=TRUE,Alternative="g"
+      )
+      
+      mwu_table <- paste("MWU_", x, "_", input, sep="")
+      
+      if (is.na (sum(read.table(mwu_table, header=T)$p.adj < 0.1) > 1)){
+        } else if (sum(read.table(mwu_table, header=T)$p.adj < 0.1) > 1){
+    
+          results=gomwuPlot(input,goAnnotations,x,
+                        
+                       absValue=0.001,
+                       level1=0.1,
+                       level2=0.05,
+                       level3=0.01,
+                       txtsize=1.4,
+                       treeHeight=2.0,
+                       colors=c("firebrick1", "lightcoral")) 
+      
+          write.csv(results[[1]], file=paste(base,"_",x,".csv", sep=''))
+          dev.off()
+      
+          png(paste(base,"_", x, ".png", sep=''))
+          results=gomwuPlot(input,goAnnotations,x,
+                        absValue=0.001,
+                        level1=0.1,
+                        level2=0.05,
+                        level3=0.01,
+                        txtsize=1.4,
+                        treeHeight=2.0,
+                        colors=c("firebrick1", "lightcoral") 
+          )
+            dev.off()
+        }
+      })
+    
+      
+}
+
+module_plot_fun <- function(color, network){
+  
+  module_plot = merge(module_plot, design, by.x = "Var2", by.y = "row.names")
+
+  module_plot = group_by(module_plot, Var1, TP, Condition) %>% mutate(avg = mean(value) ) %>% group_by(Var1, Condition) %>% 
+  mutate(Z = (avg - mean(avg)) / sd(avg)) %>% ungroup()
+
+  module_genes = module_colors==color
+  
+  module_genes <- rownames(gene_mod_membership)[module_genes]
+  
+  png(res=600, units = "in", height=4, width=8, file=paste0(color, "_Plot_", network, ".png"))
+  p <- ggplot(data = module_plot[module_plot$Var1 %in% module_genes,], aes(y = Z, x = hour+6, group = Var1)) + 
+  geom_line(alpha = 0.1) +  stat_summary(aes(color= Condition, group=NA), fun = "mean", geom = "line", alpha =   0.80, size=2, color=color) + theme_bw()  + facet_grid(.~Condition) 
+ 
+  #title = paste0(color, " expression - ", network, " network"),
+   p <- p + labs( y = "Z-score", x = "ZT (hours)") + theme(text = element_text(size=20), axis.text = element_text(colour="black"), strip.background = element_rect(fill="white")) 
+
+   print(p)
+   
+  dev.off()
+}
+
+           ##I checked, and no module has a sig. interaction between light and temperature, so just drop that
+model.lm <- lapply(MEs, function(x){
+  lm(x ~ (as.numeric(factor(df$Light)) - 1) + Temperature + hour, data=df)
+})
+
+
+mat <- lapply(model.lm, function(x){
+  return(x$coefficients)
+})
+
+mat <- do.call(rbind, mat)
+colnames(mat) <- c("Light", "Temperature", "Time")
+
+p_values = lapply(model.lm, function(x){
+  p <- summary(x)$coefficients[,4]
+})
+p_values <- do.call(rbind, p_values)
+p_values = p_values[-nrow(p_values),]
+p_adj <- apply(p_values, 2, p.adjust, method = "BH")
+
+mat = mat[-nrow(mat), ]
+
+text_mat = matrix(paste(signif(mat, 2), ", p=", signif(p_values, 2), sep = ""), nrow=nrow(mat), dimnames=dimnames(mat))
+
+text_mat[which(p_values < 0.05)] = paste(text_mat[which(p_values < 0.05)], "*")
+text_mat[which(p_values < 0.01)] = paste(text_mat[which(p_values < 0.01)], "*", sep='')
+text_mat[which(p_values > 0.05)] = ''
+
+
+mod_names <- substring(rownames(text_mat), 3)
+
+sizeGrWindow(20,12)
+par(mai = c(0.5, 3, 0, 0));
+
+png(units='in', width=20, height=12, res=300)
+
+labeledHeatmap(Matrix = mat,
+               xLabels = colnames(text_mat),
+               yLabels = rownames(text_mat),
+               ySymbols = mod_names,
+               xLabelsAngle = 0,
+               colorLabels = TRUE,
+               setStdMargins = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = text_mat,
+               cex.text = 0.95,
+               zlim = c(-0.5,0.5),
+               main = "Module-treatment relationships"
+)
+dev.off()
+```
+
+
+Full network analysis
+```{r}
+
+##### Full network
+
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Circadian.RData")
+
+design <- read.csv("SC_design.csv", row.names = 1)
+
+design$hour = (design$TP * 4) - 4
+
+rhythmic <- unique(c(sig_Align$Gene, sig_Offset$Gene))
+
+##WGCNA wants genes as columns
+dat_expr <- t(cpms[rhythmic,])
+
+n_genes = ncol(dat_expr)
+n_samples = nrow(dat_expr)
+MEs0 = moduleEigengenes(dat_expr, module_colors)$eigengenes
+MEs = orderMEs(MEs0)
+mod_names <- substring(names(MEs), 3)
+gene_mod_membership = as.data.frame(cor(dat_expr, MEs))
+
+table(module_colors)
+
+WGCNA_hubs <- chooseTopHubInEachModule(dat_expr, module_colors)
+
+#14 modules, 932 / 4192 unassigned (22%) 
+
+df = cbind(MEs, design)
+
+df$time = design$hour + 6
+
+lsp_align = sapply(names(df[,1:14]), function(ME){
+  a = randlsp(x = df[1:39, ME], time = df[1:39,]$time, from = 20, to = 28, ofac=50, type = "period", repeats=2000)
+  
+  return(a)
+})
+
+lsp_SC = sapply(names(df[,1:14]), function(ME){
+  a = randlsp(x = df[40:78, ME], time = df[40:78,]$time, from = 20, to = 28, ofac=50, type = "period", repeats=2000)
+  
+  return(a)
+})
+
+
+ps <- unlist(lsp_align[13,])
+ps <- ( (ps*2000)+1 ) / (2000+1)
+padj = p.adjust(ps, method = "BH")
+#Purple and Greenyellow are not rhythmic (p>0.05), Magenta and cyan are marginal (p=0.017 and 0.013).
+
+
+ps <- unlist(lsp_SC[13,])
+ps <- ( (ps*2000)+1 ) / (2000+1)
+padj = p.adjust(ps, method = "BH")
+#Green, Pink are not rhythmic (p>0.05), Red is marginal (p=0.019).
+
+##Functional enrichment
+setwd("GO")
+print_for_mwu <- function(color){
+  module_genes = module_colors==color
+  
+  mod_genes <- as.data.frame(rownames(gene_mod_membership))
+  mod_genes[,2] = 0
+  mod_genes[module_genes,2] = gene_mod_membership[module_genes, match(color, mod_names)]
+  
+  write.csv(mod_genes, file=(paste(color, "_kMEs.csv", sep='')), row.names = FALSE, quote = FALSE)
+  
+}
+
+#lapply(mod_names, print_for_mwu)
+
+#so the above stuff was only comparing against other genes included in the network. Compare against all genes in transcriptome.
+all_genes = results_align$Gene
+
+lapply(mod_names, print_for_mwu)
+
+setwd("GO")
+
+goAnnotations="Nvec_GO.txt" 
+goDatabase="go.obo"
+source("gomwu.functions.R")
+
+#files = file.path("F:/circadian/Tag_Seq/GO/", list.files("F:/circadian/Tag_Seq/GO/", pattern = "*_kMEs_ALL.csv") )
+  
+lapply(files[14:15], my_go_fun)
+#CC cyan, greenyellow, tan
+
+
+##KEGG
+
+#KEGGGGG
+setwd("F:/circadian/Tag_Seq/KEGG")
+
+all_genes = results_align$Gene
+
+#3129 genes are annotated with at least one KEGG term. Some have more than one
+df <- read.table("KEGG_annots.txt")
+
+other_genes = data.frame("None", all_genes[ ! all_genes %in% df$V2])
+df = rbind(df, other_genes, use.names = FALSE)
+
+#just uses a hypergeometric test. Reads in a kMEs file and assigns binary module membership
+kegg_fun_WGCNA <- function(file, name){
+  tmp = read.csv(file)
+  
+  tmp[tmp$V2!=0,]$V2 <- 1
+ 
+  res = enricher(gene = tmp[tmp[,2] == 1, 1], minGSSize = 5, TERM2GENE = df)
+ 
+  n = length(which(res@result$p.adjust < 0.05))
+  
+  head(res@result, n)$ID
+  
+  write.csv( head(res@result, n)[,c("ID", "GeneRatio", "BgRatio", "p.adjust")], file=paste0(name, "_KEGG.csv"))
+  
+}
+#e.g.
+kegg_fun_WGCNA("F:/circadian/Tag_Seq/GO/circ_WGCNA/greenyellow_kMEs_ALL.csv", name="Greenyellow_circ")
+
+
+#### Plotting ######
+
+module_plot = melt(cpms[rhythmic,])
+
+design <- read.csv("SC_design.csv", row.names = 1)
+
+design$hour = (design$TP * 4) - 4
+
+design$Condition <- factor(design$Condition, levels = c("align", "offset"), labels = c("Aligned", "SC"))
+
+sapply(unique(module_colors), module_plot_fun, "Full")
+
+
+df = cbind(MEs, design)
+
+df$time = design$hour + 6
+ 
+##I checked, and no module has a sig. interaction between light and temperature, so just drop that
+model.lm <- lapply(MEs, function(x){
+  lm(x ~ (as.numeric(factor(df$Light)) - 1) + Temperature + hour, data=df)
+})
+
+
+mat <- lapply(model.lm, function(x){
+  return(x$coefficients)
+})
+
+mat <- do.call(rbind, mat)
+colnames(mat) <- c("Light", "Temperature", "Time")
+
+p_values = lapply(model.lm, function(x){
+  p <- summary(x)$coefficients[,4]
+})
+p_values <- do.call(rbind, p_values)
+p_values = p_values[-nrow(p_values),]
+p_adj <- apply(p_values, 2, p.adjust, method = "BH")
+
+mat = mat[-nrow(mat), ]
+
+text_mat = matrix(paste(signif(mat, 2), ", p=", signif(p_values, 2), sep = ""), nrow=nrow(mat), dimnames=dimnames(mat))
+
+text_mat[which(p_values < 0.05)] = paste(text_mat[which(p_values < 0.05)], "*")
+text_mat[which(p_values < 0.01)] = paste(text_mat[which(p_values < 0.01)], "*", sep='')
+text_mat[which(p_values > 0.05)] = ''
+
+
+mod_names <- substring(rownames(text_mat), 3)
+
+sizeGrWindow(20,12)
+par(mai = c(0.5, 3, 0, 0));
+
+png(units='in', width=20, height=12, res=300, file="Full_WGCNA_cors.png")
+
+labeledHeatmap(Matrix = mat,
+               xLabels = colnames(text_mat),
+               yLabels = rownames(text_mat),
+               ySymbols = mod_names,
+               xLabelsAngle = 0,
+               colorLabels = TRUE,
+               setStdMargins = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = text_mat,
+               cex.text = 0.95,
+               zlim = c(-0.5,0.5),
+               main = "Module-treatment relationships"
+)
+dev.off()
+
+```
+
+
+Look at the Aligned-specific and SC-specific networks
+```{r}
+
+##### Just Align
+
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Align.RData")
+
+design <- read.csv("SC_design.csv", row.names = 1)[1:39,]
+
+design$hour = (design$TP * 4) - 4
+
+
+##WGCNA wants genes as columns
+dat_expr <- t(cpms[sig_Align$Gene,1:39])
+
+n_genes = ncol(dat_expr)
+n_samples = nrow(dat_expr)
+MEs0 = moduleEigengenes(dat_expr, module_colors)$eigengenes
+MEs = orderMEs(MEs0)
+mod_names <- substring(names(MEs), 3)
+gene_mod_membership = as.data.frame(cor(dat_expr, MEs))
+
+table(module_colors)
+
+Align_hubs <- chooseTopHubInEachModule(dat_expr, module_colors)
+
+
+#6 modules, 889 / 2868 unassigned (31%) 
+
+df = cbind(MEs, design)
+
+df$time = design$hour + 6
+
+align = df
+
+lsp_align = sapply(names(align[,1:7]), function(ME){
+  a = randlsp(x = align[, ME], time = align$time, from = 20, to = 28, ofac=100, type = "period")
+  
+  return(a$p.value)
+})
+
+
+
+#get eigengenes of Align network modules in SC samples
+design_SC <- read.csv("SC_design.csv", row.names = 1)[40:78,]
+SC_eigen = moduleEigengenes(t(cpms[names(module_labels),40:78]), module_colors)$eigengenes
+SC_eigen = orderMEs(SC_eigen)
+sc = cbind(SC_eigen, design_SC)
+  
+lsp_SC = sapply(names(align[,1:7]), function(ME){
+  a = randlsp(x = sc[, ME], time = align$time, from = 20, to = 28, ofac=100, type = "period")
+  
+  return(a$p.value)
+})
+
+#Brown and Blue arrythmic, yellow p=0.01
+
+
+
+table(module_colors)
+
+
+all_genes = results_align$Gene
+
+
+lapply(mod_names, print_for_mwu)
+
+
+setwd("GO")
+
+goAnnotations="Nvec_GO.txt" 
+goDatabase="go.obo"
+source("gomwu.functions.R")
+
+files = file.path("F:/circadian/Tag_Seq/GO/", list.files("F:/circadian/Tag_Seq/GO/", pattern = "*_kMEs_ALL.csv") )
+  
+lapply(files, my_go_fun)
+
+
+##KEGG
+
+#KEGGGGG
+
+library(clusterProfiler)
+library(stringr)
+library(data.table)
+
+all_genes = results_align$Gene
+#3129 genes are annotated with at least one KEGG term. Some have more than one
+df <- read.table("KEGG_annots.txt")
+
+other_genes = data.frame("None", all_genes[ ! all_genes %in% df$V2])
+df = rbind(df, other_genes, use.names = FALSE)
+
+#just uses a hypergeometric test. Reads in a kMEs file and assigns binary module membership
+kegg_fun_WGCNA <- function(file, name){
+  tmp = read.csv(file)
+  
+  tmp[tmp$V2!=0,]$V2 <- 1
+ 
+  res = enricher(gene = tmp[tmp[,2] == 1, 1], minGSSize = 5, TERM2GENE = df)
+ 
+  n = length(which(res@result$p.adjust < 0.05))
+  
+  head(res@result, n)$ID
+  
+  write.csv( head(res@result, n)[,c("ID", "GeneRatio", "BgRatio", "p.adjust")], file=paste0(name, "_KEGG.csv"))
+  
+}
+
+kegg_fun_WGCNA("F:/circadian/Tag_Seq/GO/WGCNA_justAlign/grey_kMEs_ALL.csv", name="Grey_circ")
+
+
+#### Plotting ######
+
+module_plot = melt(cpms[sig_Align$Gene,])
+
+design <- read.csv("SC_design.csv", row.names = 1)
+
+design$hour = (design$TP * 4) - 4
+
+design$Condition <- factor(design$Condition, levels = c("align", "offset"), labels = c("Aligned", "SC"))
+
+sapply(unique(module_colors), module_plot_fun, "Aligned")
+
+
+
+ ##I checked, and no module has a sig. interaction between light and temperature, so just drop that
+model.lm <- lapply(MEs, function(x){
+  lm(x ~ (as.numeric(factor(df$Light)) - 1) + Temperature + hour, data=df)
+})
+
+
+mat <- lapply(model.lm, function(x){
+  return(x$coefficients)
+})
+
+mat <- do.call(rbind, mat)
+colnames(mat) <- c("Light", "Temperature", "Time")
+
+p_values = lapply(model.lm, function(x){
+  p <- summary(x)$coefficients[,4]
+})
+p_values <- do.call(rbind, p_values)
+p_values = p_values[-nrow(p_values),]
+p_adj <- apply(p_values, 2, p.adjust, method = "BH")
+
+mat = mat[-nrow(mat), ]
+
+text_mat = matrix(paste(signif(mat, 2), ", p=", signif(p_values, 2), sep = ""), nrow=nrow(mat), dimnames=dimnames(mat))
+
+text_mat[which(p_values < 0.05)] = paste(text_mat[which(p_values < 0.05)], "*")
+text_mat[which(p_values < 0.01)] = paste(text_mat[which(p_values < 0.01)], "*", sep='')
+text_mat[which(p_values > 0.05)] = ''
+
+
+mod_names <- substring(rownames(text_mat), 3)
+
+sizeGrWindow(20,12)
+par(mai = c(0.5, 3, 0, 0));
+
+png(units='in', width=20, height=12, res=300, file="Just_Align_WGCNA_cors.png")
+
+labeledHeatmap(Matrix = mat,
+               xLabels = colnames(text_mat),
+               yLabels = rownames(text_mat),
+               ySymbols = mod_names,
+               xLabelsAngle = 0,
+               colorLabels = TRUE,
+               setStdMargins = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = text_mat,
+               cex.text = 0.95,
+               zlim = c(-0.5,0.5),
+               main = "Module-treatment relationships"
+)
+dev.off()
+
+
+### Offset-only WGCNA
+
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Offset.RData")
+
+design <- read.csv("SC_design.csv", row.names = 1)[40:78,]
+
+design$hour = (design$TP * 4) - 4
+
+
+##WGCNA wants genes as columns
+dat_expr <- t(cpms[sig_Offset$Gene,40:78])
+
+n_genes = ncol(dat_expr)
+n_samples = nrow(dat_expr)
+MEs0 = moduleEigengenes(dat_expr, module_colors)$eigengenes
+MEs = orderMEs(MEs0)
+mod_names <- substring(names(MEs), 3)
+gene_mod_membership = as.data.frame(cor(dat_expr, MEs))
+
+table(module_colors)
+
+Offset_hubs <- chooseTopHubInEachModule(dat_expr, module_colors)
+
+#10 modules, 1080 / 2440 unassigned (44%) 
+
+df = cbind(MEs, design)
+
+df$time = design$hour + 6
+
+offset = df
+
+lsp_align = sapply(names(offset[,1:10]), function(ME){
+  a = randlsp(x = offset[, ME], time = offset$time, from = 20, to = 28, ofac=100, type = "period")
+  
+  return(a$p.value)
+})
+
+#all rhythmic eigengenes
+
+table(module_colors)
+
+
+all_genes = results_align$Gene
+
+
+lapply(mod_names, print_for_mwu)
+
+
+setwd("GO")
+
+goAnnotations="Nvec_GO.txt" 
+goDatabase="go.obo"
+source("gomwu.functions.R")
+
+#files = file.path("F:/circadian/Tag_Seq/GO/", list.files("F:/circadian/Tag_Seq/GO/", pattern = "*_kMEs_ALL.csv") )
+  
+lapply(files[8:10], my_go_fun)
+##CC magenta pink
+
+#KEGGGGG
+setwd("F:/circadian/Tag_Seq/KEGG")
+library(clusterProfiler)
+library(stringr)
+library(data.table)
+
+all_genes = results_align$Gene
+#3129 genes are annotated with at least one KEGG term. Some have more than one
+df <- read.table("KEGG_annots.txt")
+
+other_genes = data.frame("None", all_genes[ ! all_genes %in% df$V2])
+df = rbind(df, other_genes, use.names = FALSE)
+
+#just uses a hypergeometric test. Reads in a kMEs file and assigns binary module membership
+kegg_fun_WGCNA <- function(file, name){
+  tmp = read.csv(file)
+  
+  tmp[tmp$V2!=0,]$V2 <- 1
+ 
+  res = enricher(gene = tmp[tmp[,2] == 1, 1], minGSSize = 5, TERM2GENE = df)
+ 
+  n = length(which(res@result$p.adjust < 0.05))
+  
+  head(res@result, n)$ID
+  
+  write.csv( head(res@result, n)[,c("ID", "GeneRatio", "BgRatio", "p.adjust")], file=paste0(name, "_KEGG.csv"))
+  
+}
+
+kegg_fun_WGCNA("F:/circadian/Tag_Seq/GO/WGCNA_justOffset/black_kMEs_ALL.csv", name="Black_circ")
+
+#### Plotting ######
+
+module_plot = melt(cpms[sig_Offset$Gene,])
+
+design <- read.csv("SC_design.csv", row.names = 1)
+
+design$hour = (design$TP * 4) - 4
+
+design$Condition <- factor(design$Condition, levels = c("align", "offset"), labels = c("Aligned", "SC"))
+
+sapply(unique(module_colors), module_plot_fun, "SC")
+
+
+ ##I checked, and no module has a sig. interaction between light and temperature, so just drop that
+model.lm <- lapply(MEs, function(x){
+  lm(x ~ (as.numeric(factor(df$Light)) - 1) + Temperature + hour, data=df)
+})
+
+
+mat <- lapply(model.lm, function(x){
+  return(x$coefficients)
+})
+
+mat <- do.call(rbind, mat)
+colnames(mat) <- c("Light", "Temperature", "Time")
+
+p_values = lapply(model.lm, function(x){
+  p <- summary(x)$coefficients[,4]
+})
+p_values <- do.call(rbind, p_values)
+p_values = p_values[-nrow(p_values),]
+p_adj <- apply(p_values, 2, p.adjust, method = "BH")
+
+mat = mat[-nrow(mat), ]
+
+text_mat = matrix(paste(signif(mat, 2), ", p=", signif(p_values, 2), sep = ""), nrow=nrow(mat), dimnames=dimnames(mat))
+
+text_mat[which(p_values < 0.05)] = paste(text_mat[which(p_values < 0.05)], "*")
+text_mat[which(p_values < 0.01)] = paste(text_mat[which(p_values < 0.01)], "*", sep='')
+text_mat[which(p_values > 0.05)] = ''
+
+
+mod_names <- substring(rownames(text_mat), 3)
+
+sizeGrWindow(20,12)
+par(mai = c(0.5, 3, 0, 0));
+
+png(units='in', width=20, height=12, res=300, file="Just_Offset_WGCNA_cors.png")
+
+labeledHeatmap(Matrix = mat,
+               xLabels = colnames(text_mat),
+               yLabels = rownames(text_mat),
+               ySymbols = mod_names,
+               xLabelsAngle = 0,
+               colorLabels = TRUE,
+               setStdMargins = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = text_mat,
+               cex.text = 0.95,
+               zlim = c(-0.5,0.5),
+               main = "Module-treatment relationships"
+)
+dev.off()
+
+```
+
+
+In this chunk, we look at the overlap between Align-specific, Offset-specific, and Full networks (Code adapted from WGCNA tutorial #2). We calculate overlaps of each pair of modules and get p-values with hypergeometric test.
+
+We also calculate and analyze the Module Preservation statistics.
+```{r}
+
+##### Both #########
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Circadian.RData")
+
+# Rename variables to avoid conflicts
+both_Labels = module_labels;
+both_Colors = module_colors;
+names(both_Colors) = names(both_Labels)
+both_Tree = gene_tree;
+both_MEs = orderMEs(MEs, greyName = "ME0")
+
+##### Just Align #########
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Align.RData")
+
+#Align and Offset used different numbers of genes, so need to use the total set (contained in the "Both" network)
+align_Labels = both_Labels
+align_Labels[TRUE] <- 0 #set everything to 0 (unassigned 'grey' module)
+align_Labels[names(module_labels)] <- module_labels
+
+
+acol = module_colors
+# Rename variables to avoid conflicts
+align_Colors = labels2colors(as.numeric(align_Labels))
+names(align_Colors) = names(align_Labels)
+align_Tree = gene_tree;
+align_MEs = orderMEs(MEs, greyName = "ME0")
+
+##### Just Offset ########
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Offset.RData")
+
+offset_Labels = both_Labels
+offset_Labels[TRUE] <- 0 #set everything to 0 (unassigned 'grey' module)
+offset_Labels[names(module_labels)] <- module_labels
+
+ocol = module_colors
+
+# Rename variables to avoid conflicts
+offset_Colors = labels2colors(as.numeric(offset_Labels))
+names(offset_Colors) = names(offset_Labels)
+offset_Tree = gene_tree;
+offset_MEs = orderMEs(MEs, greyName = "ME0")
+
+
+cpms_align <- cpms[sig_Align$Gene,1:39]
+cpms_offset <- cpms[sig_Offset$Gene,40:78]
+
+
+##Where are clock genes?
+genes <- read.table("F:/circadian/Compare/CLOCK_genes.txt")
+
+both_Colors[genes$V1]
+#Clock green, Cry1a Turquoise, Cry1b, Hes, + Par-bZIp-a Grey, Cry2 and Cry-Dash tan, CIPC and Par-BZIP-c brown (negative of Clock?)
+
+align_Colors[genes$V1]
+#Clock brown, Cry1a+Cry2+Hes+CIPC+Par-bzip-A Turquoise, Par-bZIp-C blue
+
+offset_Colors[genes$V1]
+#Clock+Cry1a yellow, Cry2 green, Hes+Par-bzip-A blue, CIPC+Par-bZIp-C Turquoise
+
+
+## Compare Align and Offset
+
+# Isolate the module labels in the order they appear in ordered module eigengenes
+align_mod_labels = substring(names(align_MEs), 3)
+offset_mod_labels = substring(names(offset_MEs), 3)
+
+# Convert the numeric module labels to color labels
+align_Modules = labels2colors(as.numeric(align_mod_labels))
+offset_Modules = labels2colors(as.numeric(offset_mod_labels))
+
+n_align_mods = length(align_Modules)
+n_offset_mods = length(offset_Modules)
+
+# Initialize tables of p-values and of the corresponding counts
+pTable = matrix(0, nrow = n_align_mods, ncol = n_offset_mods);
+CountTbl = matrix(0, nrow = n_align_mods, ncol = n_offset_mods);
+
+
+# Execute all pairwise comparisons
+for (a_mod in 1:n_align_mods)
+  for (o_mod in 1:n_offset_mods)
+  {
+    align_Members = (align_Colors == align_Modules[a_mod]);
+    offset_Members = (offset_Colors == offset_Modules[o_mod]);
+    pTable[a_mod, o_mod] = fisher.test(align_Members, offset_Members, alternative = "greater")$p.value;
+    CountTbl[a_mod, o_mod] = sum(align_Colors == align_Modules[a_mod] & offset_Colors == offset_Modules[o_mod])
+  }
+
+pTable = -log10(matrix(p.adjust(pTable, method="BH"), ncol=n_offset_mods))
+
+# Truncate p values smaller than 10^{-50} to 10^{-50} 
+pTable[is.infinite(pTable)] = 1.3*max(pTable[is.finite(pTable)]);
+pTable[pTable>50 ] = 50 ;
+
+# Marginal counts (really module sizes)
+align_mod_totals = apply(CountTbl, 1, sum)
+offset_mod_totals = apply(CountTbl, 2, sum)
+# Actual plotting
+sizeGrWindow(10,7 );
+pdf(file = "Align_vs_Offset_Modules.pdf", wi = 10, he = 7);
+par(mfrow=c(1,1));
+par(cex = 1.0);
+par(mar=c(8, 10.4, 2.7, 1)+0.3);
+# Use function labeledHeatmap to produce the color-coded table with all the trimmings
+labeledHeatmap(Matrix = pTable,
+               xLabels = paste(" ", offset_Modules),
+               yLabels = paste(" ", align_Modules),
+               colorLabels = TRUE,
+               xSymbols = paste("SC ", offset_Modules, ": ", offset_mod_totals, sep=""),
+               ySymbols = paste("Align ", align_Modules, ": ", align_mod_totals, sep=""),
+               textMatrix = CountTbl,
+               colors = blueWhiteRed(100)[50:100],
+               main = "Correspondence of Align set-specific and SC-specific modules",
+               cex.text = 1.0, cex.lab = 1.0, setStdMargins = FALSE);
+dev.off()
+
+#as expected, not much overlap between align and SC modules. Of note, "grey" here includes both bona fide "unassigned by WGNCA" genes, as well as genes that were not included in the WGCNA analysis because they were not rhythmic. 
+
+## Compare Align and Both
+
+# Isolate the module labels in the order they appear in ordered module eigengenes
+align_mod_labels = substring(names(align_MEs), 3)
+both_mod_labels = substring(names(both_MEs), 3)
+
+# Convert the numeric module labels to color labels
+align_Modules = labels2colors(as.numeric(align_mod_labels))
+both_Modules = labels2colors(as.numeric(both_mod_labels))
+
+n_align_mods = length(align_Modules)
+n_both_mods = length(both_Modules)
+
+# Initialize tables of p-values and of the corresponding counts
+pTable = matrix(0, nrow = n_align_mods, ncol = n_both_mods);
+CountTbl = matrix(0, nrow = n_align_mods, ncol = n_both_mods);
+
+
+# Execute all pairwise comparisons
+for (a_mod in 1:n_align_mods)
+  for (o_mod in 1:n_both_mods)
+  {
+    align_Members = (align_Colors == align_Modules[a_mod]);
+    both_Members = (both_Colors == both_Modules[o_mod]);
+    pTable[a_mod, o_mod] = -log10(fisher.test(align_Members, both_Members, alternative = "greater")$p.value);
+    CountTbl[a_mod, o_mod] = sum(align_Colors == align_Modules[a_mod] & both_Colors == both_Modules[o_mod])
+  }
+
+#save for Sankey diagrams later
+tbl_AB <- CountTbl
+
+# Truncate p values smaller than 10^{-50} to 10^{-50} 
+pTable[is.infinite(pTable)] = 1.3*max(pTable[is.finite(pTable)]);
+pTable[pTable>50 ] = 50 ;
+# Marginal counts (really module sizes)
+align_mod_totals = apply(CountTbl, 1, sum)
+both_mod_totals = apply(CountTbl, 2, sum)
+# Actual plotting
+sizeGrWindow(10,7 );
+pdf(file = "Align_vs_both_Modules.pdf", wi = 10, he = 7);
+par(mfrow=c(1,1));
+par(cex = 1.0);
+par(mar=c(8, 10.4, 2.7, 1)+0.3);
+# Use function labeledHeatmap to produce the color-coded table with all the trimmings
+labeledHeatmap(Matrix = pTable,
+               xLabels = paste(" ", both_Modules),
+               yLabels = paste(" ", align_Modules),
+               colorLabels = TRUE,
+               xSymbols = paste("Both ", both_Modules, ": ", both_mod_totals, sep=""),
+               ySymbols = paste("Align ", align_Modules, ": ", align_mod_totals, sep=""),
+               textMatrix = CountTbl,
+               colors = blueWhiteRed(100)[50:100],
+               main = "Correspondence of Align set-specific and Consensus modules",
+               cex.text = 1.0, cex.lab = 1.0, setStdMargins = FALSE);
+dev.off()
+
+## Compare Offset and Both
+
+# Isolate the module labels in the order they appear in ordered module eigengenes
+offset_mod_labels = substring(names(offset_MEs), 3)
+both_mod_labels = substring(names(both_MEs), 3)
+
+# Convert the numeric module labels to color labels
+offset_Modules = labels2colors(as.numeric(offset_mod_labels))
+both_Modules = labels2colors(as.numeric(both_mod_labels))
+
+n_offset_mods = length(offset_Modules)
+n_both_mods = length(both_Modules)
+
+# Initialize tables of p-values and of the corresponding counts
+pTable = matrix(0, nrow = n_offset_mods, ncol = n_both_mods);
+CountTbl = matrix(0, nrow = n_offset_mods, ncol = n_both_mods);
+
+
+# Execute all pairwise comparisons
+for (a_mod in 1:n_offset_mods)
+  for (o_mod in 1:n_both_mods)
+  {
+    offset_Members = (offset_Colors == offset_Modules[a_mod]);
+    both_Members = (both_Colors == both_Modules[o_mod]);
+    pTable[a_mod, o_mod] = -log10(fisher.test(offset_Members, both_Members, alternative = "greater")$p.value);
+    CountTbl[a_mod, o_mod] = sum(offset_Colors == offset_Modules[a_mod] & both_Colors == both_Modules[o_mod])
+  }
+
+#save for Sankey diagrams later
+tbl_OB <- CountTbl
+
+# Truncate p values smaller than 10^{-50} to 10^{-50} 
+pTable[is.infinite(pTable)] = 1.3*max(pTable[is.finite(pTable)]);
+pTable[pTable>50 ] = 50 ;
+# Marginal counts (really module sizes)
+offset_mod_totals = apply(CountTbl, 1, sum)
+both_mod_totals = apply(CountTbl, 2, sum)
+# Actual plotting
+sizeGrWindow(10,7 );
+pdf(file = "offset_vs_both_Modules.pdf", wi = 10, he = 7);
+par(mfrow=c(1,1));
+par(cex = 1.0);
+par(mar=c(8, 10.4, 2.7, 1)+0.3);
+# Use function labeledHeatmap to produce the color-coded table with all the trimmings
+labeledHeatmap(Matrix = pTable,
+               xLabels = paste(" ", both_Modules),
+               yLabels = paste(" ", offset_Modules),
+               colorLabels = TRUE,
+               xSymbols = paste("Both ", both_Modules, ": ", both_mod_totals, sep=""),
+               ySymbols = paste("offset ", offset_Modules, ": ", offset_mod_totals, sep=""),
+               textMatrix = CountTbl,
+               colors = blueWhiteRed(100)[50:100],
+               main = "Correspondence of offset set-specific and Consensus modules",
+               cex.text = 1.0, cex.lab = 1.0, setStdMargins = FALSE);
+dev.off()
+
+
+## Compare Eignengene neworks
+#some idiosyncratic formatting for WGCNA
+
+nSets = 2;
+# For easier labeling of plots, create a vector holding descriptive names of the two sets.
+setLabels = c("Align", "Offset")
+shortLabels = c("Align", "SC")
+
+
+# Form multi-set expression data: columns starting from 9 contain actual expression data.
+multiExpr = vector(mode = "list", length = nSets)
+
+dat_expr <- t(cpms[names(align_Labels),])
+
+multiExpr[[1]] = list(data = as.data.frame(dat_expr[1:39,]));
+
+rownames(multiExpr[[1]]$data) = rownames(dat_expr)[1:39];
+multiExpr[[2]] = list(data = as.data.frame(dat_expr[40:78,]));
+
+rownames(multiExpr[[2]]$data) = rownames(dat_expr)[40:78];
+# Check that the data has the correct format for many functions operating on multiple sets:
+exprSize = checkSets(multiExpr)
+
+col_mat = matrix(nrow = 4192, ncol = nSets)
+col_mat[,1] = align_Colors
+col_mat[,2] = offset_Colors
+
+multi_Col <- list(align_Colors, offset_Colors)
+expr2 = vector(mode = "list", length = nSets)
+expr2[[1]] = list(data = as.data.frame(t(cpms_align)))
+expr2[[2]] = list(data = as.data.frame(t(cpms_offset)))
+col2 = list(acol, ocol)
+
+#this considers all n=4192 genes. 
+pres <- modulePreservation(multiData = multiExpr, multiColor = multi_Col, corFnc = "bicor", networkType = "signed hybrid", nPermutations = 200, verbose=3, greyName="grey")
+
+#this only considers genes that are found in both sets (so n=1116)
+pres_shared <- modulePreservation(multiData = expr2, multiColor = col2, corFnc = "bicor", networkType = "signed hybrid",  nPermutations = 200, verbose=3, greyName="grey")
+
+load("preservation.RData")
+load("preservation_shared.RData")
+
+pres$accuracy$observed[[1]][[2]]
+pres$accuracy$observedFisherPvalues
+
+pres$preservation$Z[[1]][[2]]
+pres_shared$preservation$Z[[1]][[2]]
+
+
+
+
+#### Plotting ######
+
+module_plot = melt(cpms[rhythmic,])
+
+design <- read.csv("SC_design.csv", row.names = 1)
+
+design$hour = (design$TP * 4) - 4
+
+design$Condition <- factor(design$Condition, levels = c("align", "offset"), labels = c("Aligned", "SC"))
+
+sapply(unique(module_colors), module_plot_fun, "Consensus")
+
+
+
+```
+
+
+#Sankey plot to visualize overlap between all 3 networks
+```{r}
+###
+
+#Vis with Sankey plot!!! I imagine Full network in the middle, align and offset on either side. 
+library(networkD3)
+library(dplyr)
+
+
+
+####
+
+tbl_AB
+
+tbl_OB
+
+#Align vs Offset.
+colnames(tbl_AB) <- paste0(both_Modules, "_B")
+rownames(tbl_AB) <- paste0(align_Modules, "_A")
+
+colnames(tbl_OB) <- paste0(both_Modules, "_B")
+rownames(tbl_OB) <- paste0(offset_Modules, "_O")
+
+#remove grey
+#data = CountTbl[-7, -10]
+
+links_AB <- tbl_AB %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var="source") %>% 
+  gather(key="target", value="value", -1) %>%
+  filter(value != 0)
+
+#flip source and target here
+links_OB <- tbl_OB %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var="target") %>% 
+  gather(key="source", value="value", -1) %>%
+  filter(value != 0)
+
+links = rbind(links_AB, links_OB)
+
+nodes <- data.frame(
+  name=c(as.character(links$source), as.character(links$target)) %>% 
+    unique()
+  )
+
+links$IDsource <- match(links$source, nodes$name)-1 
+links$IDtarget <- match(links$target, nodes$name)-1
+
+links$group <- as.factor("keep")
+levels(links$group) <- c("keep", "drop", "highlight")
+links[grep("grey", links$source),]$group = as.factor("drop")
+links[grep("grey", links$target),]$group = as.factor("drop")
+links[links$source =="green_A" & links$target=="blue_B",]$group = as.factor("highlight")
+links[links$source =="blue_B" & links$target=="blue_O",]$group = as.factor("highlight")
+links[links$source =="turquoise_A" & links$target=="turquoise_B",]$group = as.factor("highlight")
+links[links$source =="turquoise_B" & links$target=="turquoise_O",]$group = as.factor("highlight")
+links[links$source =="turquoise_A" & links$target=="brown_B",]$group = as.factor("highlight")
+links[links$source =="brown_B" & links$target=="turquoise_O",]$group = as.factor("highlight")
+links[links$source =="brown_B" & links$target=="yellow_O",]$group = as.factor("highlight")
+
+nodes$group <- as.factor(nodes$name)
+
+nodes$group <- as.factor( sapply(strsplit(nodes$name,"_"), `[`, 1) )
+
+levels(nodes$group) <- c(levels(nodes$group), "drop")
+nodes[grep("grey", nodes$name),]$group = as.factor("drop")
+
+
+my_color <- 'd3.scaleOrdinal() .domain(["keep", "drop", "hihglight", "node_keep"]) .range(["grey", "#00000000", "firebrickred", "steelblue"])'
+
+#this may be hideous
+my_color <- 'd3.scaleOrdinal() .domain(["keep", "drop", "highlight", "black", "blue", "brown", "cyan", "green", "greenyellow", "magenta", "pink", "purple", "red", "salmon", "tan", "turquoise", "yellow"]) .range(["grey", "#00000000", "black", "black", "blue", "brown", "cyan", "green", "greenyellow", "magenta", "pink", "purple", "red", "salmon", "tan", "turquoise", "yellow"])'
+
+#try to highlight connections between Blue-A and Turquoise-A.
+
+
+# Make the Network
+p <- sankeyNetwork(Links = links, Nodes = nodes,
+                     Source = "IDsource", Target = "IDtarget",
+                     Value = "value", NodeID = "name", 
+                     sinksRight=FALSE, LinkGroup="group", NodeGroup="group",
+                      colourScale=my_color, fontSize=0)
+
+p
+
+
+
+```
+
+
+
+Finally, this chunk is where we calculate all the connectivity statistics (kIM, kME, etc.), including the proportion of variation explained by eigengene expression (adapted from Rose et al. 2015 DOI:10.1093/gbe/evv258)
+```{r}
+
+"amount of expression variation explained by eigengene expression"
+
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Align.RData")
+
+align_labels = module_labels
+align_colors = module_colors
+align_MEs = orderMEs(MEs, greyName = "ME0")
+
+##### Just Offset ########
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Offset.RData")
+
+offset_labels = module_labels
+offset_colors = module_colors
+offset_MEs = orderMEs(MEs, greyName = "ME0")
+
+
+
+## Compare Align and Offset
+
+# Isolate the module labels in the order they appear in ordered module eigengenes
+align_mod_labels = substring(names(align_MEs), 3)
+offset_mod_labels = substring(names(offset_MEs), 3)
+
+
+
+
+#so eigengenes explain more of the variance of rhtyhmic genes in SC?
+##### Both #########
+options(stringsAsFactors = FALSE);
+lnames = load("WGCNA_Circadian.RData")
+
+both_mod_labels = substring(names(MEs), 3)
+
+cpms = t(dat_expr)
+
+names(module_colors) = rownames(cpms)
+
+#this if for all n=4192 genes
+res_Var_A <- sapply(rownames(cpms), function(gene){
+  data = cpms[gene, 1:39]
+  label = module_labels[gene]
+  ME_column = which(both_mod_labels==label)
+  
+  test = lm(data ~ MEs[1:39,ME_column])
+  
+  return( var(test$residuals) )
+})
+
+res_Var_A = res_Var_A[module_colors != "grey"]
+
+Var_Align = apply(cpms[,1:39], 1, var)
+Var_Align = Var_Align[module_colors != "grey"]
+
+eigen_Var_A = 1 - (res_Var_A / Var_Align) 
+
+res_Var_SC <- sapply(rownames(cpms), function(gene){
+  data = cpms[gene, 40:78]
+  label = module_labels[gene]
+  ME_column = which(both_mod_labels==label)
+  
+  test = lm(data ~ MEs[40:78,ME_column])
+  
+  return( var(test$residuals) )
+})
+
+res_Var_SC = res_Var_SC[module_colors != "grey"]
+
+Var_SC = apply(cpms[,40:78], 1, var)
+Var_SC = Var_SC[module_colors != "grey"]
+
+eigen_Var_SC = 1 - (res_Var_SC / Var_SC) 
+
+wilcox.test(eigen_Var_A, eigen_Var_SC)
+#1e-11
+
+(median(eigen_Var_SC) - median(eigen_Var_A) ) / median(eigen_Var_A)
+
+non_grey_mods = module_colors[module_colors!="grey"]
+
+sapply(unique(module_colors), function(mod){
+  mean(eigen_Var_A[non_grey_mods == mod])
+})
+
+sapply(unique(module_colors), function(mod){
+  mean(eigen_Var_SC[non_grey_mods == mod])
+})
+
+mod_prop = sapply(unique(non_grey_mods), function(color){
+  p = wilcox.test(eigen_Var_A[non_grey_mods == color], eigen_Var_SC[non_grey_mods == color])
+  
+  return( c(median(eigen_Var_A[non_grey_mods == color]), median(eigen_Var_SC[non_grey_mods == color]), p$p.value) ) 
+})
+
+mod_prop[3,] <- p.adjust(mod_prop[3,], method="BH")
+#Turquoise, Red, Black, Green, Pink less connected in SC
+#Blue, Purple (marginal), Magenta more var.
+#Yellow, Tan, Brown, Salmon, Cyan, Greenyellow  no difference (p>0.05)
+
+#but in the above analysis, we are including genes that were not rhythmic in both time series. May be more informative to calculate the above metrics, but only for rhythmic genes (in each time series).
+
+
+wilcox.test(eigen_Var_A[rownames(sig_Align)], eigen_Var_SC[rownames(sig_Offset)])
+#5e-5
+
+(median(eigen_Var_SC[rownames(sig_Offset)], na.rm=T) - median(eigen_Var_A[rownames(sig_Align)], na.rm=T) ) / median(eigen_Var_A[rownames(sig_Align)], na.rm=T)
+#-4.5%
+
+wilcox.test(eigen_Var_A[shared], eigen_Var_SC[shared])
+#0.017
+(median(eigen_Var_SC[shared], na.rm=T) - median(eigen_Var_A[shared], na.rm=T) ) / median(eigen_Var_A[shared], na.rm=T)
+#-5.2%
+
+wilcox.test(eigen_Var_A[Align_only$Gene], eigen_Var_SC[Offset_only$Gene])
+#0.0021
+(median(eigen_Var_SC[Offset_only$Gene], na.rm=T) - median(eigen_Var_A[Align_only$Gene], na.rm=T) ) / median(eigen_Var_A[Align_only$Gene], na.rm=T)
+#-4.4%
+
+
+plot_df <- data.frame(Module = module_colors, p_align=0, p_SC=0, phase_align=0, phase_SC=0) %>% arrange(Module) %>% filter(Module != "grey")
+
+plot_df = data.table(plot_df)
+
+for (mod in unique(module_colors)) {
+  module_genes = names(module_labels)[module_colors==mod]
+
+  p_align = results_align[module_genes,]$pVal
+  p_SC = results_offset[module_genes,]$pVal
+  phase_align = results_align[module_genes,]$Circa_phase
+  phase_SC = results_offset[module_genes,]$Circa_phase
+
+  plot_df[Module==mod,]$p_align <- p_align
+  plot_df[Module==mod,]$p_SC <- p_SC
+  plot_df[Module==mod,]$phase_align <- phase_align
+  plot_df[Module==mod,]$phase_SC <- phase_SC
+}
+
+
+
+plot_df$p_diff <- -log10(plot_df$p_SC) - -log10(plot_df$p_align)
+
+#plot difference in log10 p-values for Aligned and SC in each modules
+p <- ggplot(plot_df, aes(y=Module, x=p_diff, color=Module)) + geom_jitter(alpha=0.3, size=1.2) + theme_dark() + geom_vline(xintercept = 0, color="black") + scale_color_manual(values=unique(plot_df$Module))
+ p 
+ 
+ plot_df$Module = factor(plot_df$Module)
+ 
+ p <- ggplot(plot_df, aes(y=Module, x=p_diff, fill=Module)) + geom_boxplot() + theme_bw() + geom_vline(xintercept = 0, color="black") + scale_fill_manual(values=unique(as.character(plot_df$Module))) 
+ 
+ png(res=300, width=4, height=4, units='in', file="WGCNA_Pdiff.png")
+ p + scale_y_discrete(limits = rev(levels(plot_df$Module))) + theme(legend.position="none")
+ dev.off()
+ 
+df = rbind(plot_df, plot_df)
+
+df$Group <- c( rep("Aligned", 3260), rep("SC", 3260))
+
+df$Phase <- df$phase_align
+df$pVal <- df$p_align
+
+df[df$Group=="SC",]$Phase = df[df$Group=="SC",]$phase_SC
+df[df$Group=="SC",]$pVal = df[df$Group=="SC",]$p_SC
+
+df <- df %>% select(Module, Group, Phase, pVal)
+
+mod="black"
+
+  
+######## from GO stuff:
+p <- ggplot(df[Module==mod,], aes(x=Phase, y=-log10(pVal), fill=Group, color=Group)) + geom_point() 
+p <- p + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + theme_bw()
+  
+p <- ggplot(df[Module==mod,], aes(x=Phase, fill=Group)) + geom_density(aes( weight=-log10(pVal)), position="identity", alpha=0.4 ) + scale_fill_manual(values=c("steelblue", "black"))
+
+p <- p + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + theme_bw()
+
+p
+
+
+##different kind of plot. Two panels, Align and SC? And phase on the x-axis, module on the y-axis?
+library(ggridges)
+
+##Do some stuff to ensure the density function is circularized (from https://stackoverflow.com/questions/36266402/ggplot2-density-of-circular-data)
+
+# Stack three copies of the data, with adjusted values of Phase
+df_wrap = bind_rows(df, df, df)
+df_wrap$Phase = df_wrap$Phase + rep(c(0,24,24*2),each=nrow(df))
+
+#phases between 24 and 48 inclusive
+df_wrap_middle = df_wrap[df_wrap$Phase %between% c(24, 48)]
+
+df_wrap$Module = factor(df_wrap$Module)
+
+# New "circularized" version of plot
+p <- df_wrap %>% ggplot(aes(x=Phase, y=Module, fill=Module)) + 
+  geom_density_ridges(alpha=0.8, rel_min_height=0.01, scale=0.95, panel_scaling = FALSE, bandwidth=1) + 
+  coord_cartesian(xlim=c(24, 48), expand=0) + theme_bw() + scale_fill_manual(values=unique(as.character(df$Module))) + facet_wrap(.~Group) 
+  #the point is that coord-cartesian just calculates density for the "middle" dataset
+
+#and I do need to renormalize the densities to 1. With the weighted data:
+
+
+p <- df_wrap %>% ggplot(aes(x=Phase, y=Module, fill=Module)) + 
+  geom_density_ridges(aes(height=..density.., weight=-log10(pVal)), adjust=1/6, stat="density", rel_min_height=0.01, panel_scaling = FALSE, scale=0.95, alpha=0.8) + coord_cartesian(xlim = c(24, 48))
+
+p <- p + theme_bw() + scale_fill_manual(values=unique(as.character(df$Module))) + facet_wrap(.~Group) + theme(strip.background =element_rect(fill="white"))
+
+#bug https://github.com/tidyverse/ggplot2/issues/4498, Windows graphics have problem wtih alpha+clipping. Use AGG.
+agg_png(res=600, width=8, height=5, units='in', file="F:/circadian/plots/Fig_WGCNA/WGCNA_Ridgeplot.png")
+
+p + scale_x_continuous(breaks=c(24, 30, 36, 42), labels=c(0, 6, 12, 18), expand=c(0,0)) + scale_y_discrete(limits = rev(levels(df_wrap$Module)), expand = expansion(add = c(0, 1.05))) + theme(legend.position="none", text = element_text(size=20), axis.text = element_text(colour="black")) + scale_y_discrete(limits = rev(levels(df_wrap$Module)), labels = rev(str_to_title(levels(df_wrap$Module))))
+
+dev.off()
+
+#put in Phase order
+df_wrap$Module <- factor(df_wrap$Module, levels=c("pink", "red", "brown", "turquoise", "cyan", "tan", "salmon", "magenta", "greenyellow", "black", "green", "blue", "yellow", "purple" ))
+
+p <- df_wrap %>% ggplot(aes(x=Phase, y=Module, fill=Module)) + 
+  geom_density_ridges(aes(height=..density.., weight=-log10(pVal)), adjust=1/6, stat="density", rel_min_height=0.01, panel_scaling = FALSE, scale=0.95, alpha=0.8) + coord_cartesian(xlim = c(24, 48))
+
+p <- p + theme_bw() + scale_fill_manual(values=levels(df_wrap$Module)) + facet_wrap(.~Group) + theme(strip.background =element_rect(fill="white"))
+
+agg_png(res=600, width=8, height=5, units='in', file="F:/circadian/plots/Fig_WGCNA/WGCNA_Ridgeplot_Phase.png")
+
+p + scale_x_continuous(breaks=c(24, 30, 36, 42), labels=c(0, 6, 12, 18), expand=c(0,0)) + scale_y_discrete(limits = rev(levels(df_wrap$Module)), expand = expansion(add = c(0, 1.05))) + theme(legend.position="none", text = element_text(size=20), axis.text = element_text(colour="black")) + scale_y_discrete(limits = rev(levels(df_wrap$Module)), labels = rev(str_to_title(levels(df_wrap$Module))))
+
+dev.off()
+
+#put in order of Sankey plot
+df_wrap$Module <- factor(df_wrap$Module, levels=c("green", "yellow", "purple", "blue", "black", "magenta", "greenyellow", "pink", "red", "turquoise", "salmon", "brown", "cyan", "tan" ))
+
+p <- df_wrap %>% ggplot(aes(x=Phase, y=Module, fill=Module)) + 
+  geom_density_ridges(aes(height=..density.., weight=-log10(pVal)), adjust=1/6, stat="density", rel_min_height=0.01, panel_scaling = FALSE, scale=0.95, alpha=0.8) + coord_cartesian(xlim = c(24, 48))
+
+p <- p + theme_bw() + scale_fill_manual(values=levels(df_wrap$Module)) + facet_wrap(.~Group) + theme(strip.background =element_rect(fill="white"))
+
+agg_png(res=600, width=8, height=5, units='in', file="F:/circadian/plots/Fig_WGCNA/WGCNA_Ridgeplot_Sankey.png")
+
+p + scale_x_continuous(breaks=c(24, 30, 36, 42), labels=c(0, 6, 12, 18), expand=c(0,0)) + scale_y_discrete(limits = rev(levels(df_wrap$Module)), expand = expansion(add = c(0, 1.05))) + theme(legend.position="none", text = element_text(size=20), axis.text = element_text(colour="black")) + scale_y_discrete(limits = rev(levels(df_wrap$Module)), labels = rev(str_to_title(levels(df_wrap$Module))))
+
+dev.off()
+
+###
+labs_2_cols = as.data.frame(cbind(unique(module_labels), unique(module_colors)) )
+
+  
+Aligned_kMEs = signedKME( t(cpms[,1:39]), MEs[1:39,], outputColumnName="ME", corFnc="bicor")
+SC_kMEs = signedKME( t(cpms[,40:78]), MEs[40:78,], outputColumnName="ME", corFnc="bicor")
+
+Aligned_mod_kME <- sapply(unique(non_grey_mods), function(color){
+  module_genes = module_colors==color
+  
+  mod_genes <- as.data.frame(rownames(Aligned_kMEs)[module_genes])
+  
+  ME_column = labs_2_cols[labs_2_cols$V2==color,]$V1
+  
+  mod_genes[,2] = Aligned_kMEs[module_genes, paste0("ME",ME_column)]
+  
+})
+
+SC_mod_kME <- sapply(unique(non_grey_mods), function(color){
+  module_genes = module_colors==color
+  
+  mod_genes <- as.data.frame(rownames(SC_kMEs)[module_genes])
+   ME_column = labs_2_cols[labs_2_cols$V2==color,]$V1 
+   
+  mod_genes[,2] = SC_kMEs[module_genes, paste0("ME",ME_column)]
+})
+
+kMEs_A <- unlist(Aligned_mod_kME)
+kMEs_SC <- unlist(SC_mod_kME)
+
+names(kMEs_A) = names(non_grey_mods)
+names(kMEs_SC) = names(non_grey_mods)
+
+(median(kMEs_SC) - median(kMEs_A)) / median(kMEs_A)
+#5.6% reduction median
+
+median(kMEs_A)
+#0.535, mean 0.538
+median(kMEs_SC)
+#0.505, mean 0.502
+
+#SC has less connectivity overall
+wilcox.test(kMEs_A, kMEs_SC)
+#5.5e-15
+
+#module by module:
+connec = sapply(unique(non_grey_mods), function(color){
+  p = wilcox.test(Aligned_mod_kME[color][[1]], SC_mod_kME[color][[1]])
+  
+  return( c(median(Aligned_mod_kME[color][[1]]), median(SC_mod_kME[color][[1]]), p$p.value) ) 
+})
+
+connec[3,] <- p.adjust(connec[3,], method="BH")
+#Turuoise, Red, black,  green, pink less connected in SC (n=1702)
+#Blue, Purple, Magenta, Greenyellow more connected (n=722)
+#Yellow, Tan, Brown, Salmon, Cyan no difference (p>0.05) (n=836)
+
+#if we just look at rhythmic genes: 
+
+wilcox.test(kMEs_A[rownames(sig_Align)], kMEs_SC[rownames(sig_Offset)])
+#0.0019
+
+(median(kMEs_SC[rownames(sig_Offset)], na.rm=T) - median(kMEs_A[rownames(sig_Align)], na.rm=T) ) / median(kMEs_A[rownames(sig_Align)], na.rm=T)
+#-2.1%
+
+wilcox.test(kMEs_A[shared], kMEs_SC[shared])
+#1.05e-12
+(median(kMEs_SC[shared], na.rm=T) - median(kMEs_A[shared], na.rm=T) ) / median(kMEs_A[shared], na.rm=T)
+#-9.4%
+
+wilcox.test(kMEs_A[Align_only$Gene], kMEs_SC[Offset_only$Gene])
+#0.019
+(median(kMEs_SC[Offset_only$Gene], na.rm=T) - median(kMEs_A[Align_only$Gene], na.rm=T) ) / median(kMEs_A[Align_only$Gene], na.rm=T)
+#+5.9%
+#actually higher connectivity among SC-specific genes
+
+
+Align_kIM <- intramodularConnectivity.fromExpr(t(cpms[,1:39]), module_colors, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = F)
+
+SC_kIM <- intramodularConnectivity.fromExpr(t(cpms[,40:78]), module_colors, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = F)
+
+wilcox.test(Align_kIM, SC_kIM)
+#2.2e-16
+
+#####Connectivity of all genes, including grey
+
+tmp1 <- intramodularConnectivity.fromExpr(t(cpms[,1:39]), module_colors, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = T)
+
+tmp2 <- intramodularConnectivity.fromExpr(t(cpms[,40:78]), module_colors, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = T)
+
+wilcox.test(tmp1$kTotal, tmp2$kTotal)
+#SC n=4192 lower median 2.47 vs. 2.80, p=5e-15.
+
+tmp1 <- intramodularConnectivity.fromExpr(t(cpms[sig_Align$Gene,1:39]), align_colors, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = T)
+
+tmp2 <- intramodularConnectivity.fromExpr(t(cpms[sig_Offset$Gene,40:78]), offset_colors, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = T)
+
+wilcox.test(tmp1$kTotal, tmp2$kTotal)
+#2e-16, 3.86 vs. 2.68
+#connectivity of each gene in the whole network was. 
+
+#median(Align_kIM) = 1.36, median(SC_kIM) <- 1.05
+
+
+
+(median(SC_kIM, na.rm=T) - median(Align_kIM, na.rm=T)) / median(Align_kIM, na.rm=T)
+#23% reduction median, 35% lower
+
+
+#perhaps notably that shared genes have higher kIM in Align, lower than average in SC
+KIM = sapply(unique(non_grey_mods), function(color){
+  p = wilcox.test(Align_kIM[module_colors==color], SC_kIM[module_colors==color])
+  
+  return( c(median(Align_kIM[module_colors==color]), median(SC_kIM[module_colors==color]), p$p.value) ) 
+})
+KIM[3,] <- p.adjust(KIM[3,], method="BH")
+#Turquoise, Red, Black, Green, Pink 
+#Blue,  Purple, Magenta, Greenyellow
+#Yellow, Tan, Brown, Salmon, Cyan
+
+names(Align_kIM) = names(non_grey_mods)
+names(SC_kIM) = names(non_grey_mods)
+
+wilcox.test(Align_kIM[rownames(sig_Align)], SC_kIM[rownames(sig_Offset)])
+#2.2e-16
+
+(median(SC_kIM[rownames(sig_Offset)], na.rm=T) - median(Align_kIM[rownames(sig_Align)], na.rm=T) ) / median(Align_kIM[rownames(sig_Align)], na.rm=T)
+#-47%
+
+wilcox.test(Align_kIM[shared], SC_kIM[shared])
+#2.2e-16
+(median( SC_kIM[shared], na.rm=T) - median(Align_kIM[shared], na.rm=T) ) / median(Align_kIM[shared], na.rm=T)
+#-48%
+
+wilcox.test(Align_kIM[Align_only$Gene],  SC_kIM[Offset_only$Gene])
+#2.2e-16
+(median( SC_kIM[Offset_only$Gene], na.rm=T) - median(Align_kIM[Align_only$Gene], na.rm=T) ) / median(Align_kIM[Align_only$Gene], na.rm=T)
+#-45%
+
+#and again, if we restrict to rhythmic genes:
+Align_kIM <- intramodularConnectivity.fromExpr(t(cpms_align), align_cols, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = F)
+
+SC_kIM <- intramodularConnectivity.fromExpr(t(cpms_offset), offset_cols, corFnc="bicor", networkType = "signed hybrid", getWholeNetworkConnectivity = F)
+
+wilcox.test(Align_kIM, SC_kIM)
+#2.2e-16
+
+
+
+```
+
