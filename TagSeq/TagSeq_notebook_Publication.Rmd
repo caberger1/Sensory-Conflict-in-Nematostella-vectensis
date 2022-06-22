@@ -1,0 +1,934 @@
+---
+title: "Sensory Conflict data analysis"
+output: html_notebook
+
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+TagSeq reads were quantified against the Nematostella genome at SIMRBase (https://genomes.stowers.org/starletseaanemone) (Nvec200_v1) with Salmon v1.5.1. 
+
+First, load in the data. 
+
+```{r warning=FALSE, message=FALSE}
+setwd("F:/circadian/Tag_Seq/")
+
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(viridis)
+library(tximport)
+library(readr)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(DESeq2)
+library(stringr)
+library(circular)
+library(limorhyde)
+library(circacompare)
+library(data.table)
+
+cpms <- read.table(file="TMM_tagSeq.txt") #Identical to Fig5_Source_Data_1
+design <- read.csv("SC_design.csv", row.names = 1)
+
+```
+
+
+Discriminant analysis (DAPC):
+
+Unlike PCA, which is unsupervised, DAPC finds the vector in gene expression space that maximizes the distance between preselected groups (the discriminant). First, I will just apply this to the Aligned data.
+```{r warning=FALSE}
+library(adegenet)
+
+align_data <- cpms[, 1:39]
+offset_data <- cpms[, 40:78]
+  
+dp <- dapc(t(align_data), design$Light[1:39], n.da=1, perc.pca=80)
+
+
+assemble_dp_coords = function(dp.object){
+  res = tibble(Run = rownames(dp.object$ind.coord),
+               LD1 = dp.object$ind.coord[,'LD1'],
+               group = as.character(dp.object$grp))
+}
+
+coords = assemble_dp_coords(dp)
+
+p <- coords %>% 
+  ggplot(aes(x=LD1,fill=group)) +
+  geom_density(alpha=0.8) + theme_bw() + xlim(c(-10, 10)) + geom_point( aes(y = 0))
+#so, good news: there is a discriminant that totally separates light and dark samples under Aligned conditions. we can then plot the OFFSET samples on this axis, to assess how diurnal transcription shifts in response to the shifted temperature cycle.
+yl <- "#FFFFCC"
+bl <- "#253494"
+
+
+p + scale_fill_manual(values=c("black", "lightgrey")) + scale_colour_manual(values=c('black', 'lightgrey')) +
+  geom_point( aes(y = 0, fill = group), shape=21, color="black") +
+  theme(text=element_text(size=20)) #change font size of all text
+
+
+assemble_pred_coords = function(pred.object, group.vector){
+  res = tibble(Run = rownames(pred.object$ind.scores),
+               LD1 = pred.object$ind.scores[,'LD1'],
+               group = group.vector)
+}
+
+pred_Offset <- predict.dapc(dp, newdata = (t(offset_data)))
+Offset_coords <- assemble_pred_coords(pred_Offset, design$Light[40:78])
+
+df <- rbind(coords, Offset_coords)
+df$group = paste(design$Condition, design$Light, sep="_")
+
+df %>% 
+  ggplot(aes(x=LD1,fill=group)) +
+  geom_density(alpha=0.7) +
+  theme_bw() + xlim(c(-10, 10)) +  geom_point( aes(y = 0, fill = group), shape=21, color="black") + theme(text=element_text(size=20)) +
+  scale_fill_manual(values=c('black', 'lightgrey', bl, yl), name = "Group", labels = c("Aligned Light", "Aligned Dark", "SC Light", "SC Dark")) + 
+  scale_colour_manual(values=c('black', 'lightgrey', bl, yl))
+
+
+```
+
+Some interesting things to note here! First, there are clearly substantial shifts in gene expression associated with sensory conflict. Genes that distinguish light from dark samples under Aligned conditions no longer do so with a different TC. Second, if anything, the Offset Light samples are closer to the Aligned Dark samples, and vice versa. This suggests that the expression of some diurnal genes was reversed by SC (and I will confirm this later on).
+
+Part 2. DE analysis
+
+Although the main focus of this paper will be on rhythmic gene expression, we can also gain some insights from normal DE analysis, in this case with limma. 
+
+we've already filtered out low-expressed genes using the filterByExpr function, to generate the TMM_tagSeq.txt file. In this chunk, we repeat these steps and conduct DE using the txi object. 
+```{r warning=FALSE}
+
+load("txi_counts.Rdata")
+y <- DGEList(txi$counts)
+
+#rename the libraries
+row.names(y$samples) <- gsub(".*-","", row.names(y$samples) )
+row.names(y$samples) <- gsub("_.*","", row.names(y$samples) )
+colnames(y$counts) <- gsub(".*-","", colnames(y$counts) ) 
+colnames(y$counts) <- gsub("_.*","", colnames(y$counts) )
+
+#re-order
+y$counts <- y$counts[,order(colnames(y$counts))]
+keep <- filterByExpr(y, group= interaction(design$Condition, design$TP) )
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y, method = "TMM")
+#keeps 12,294 with full design grouping (condition * Time)
+
+#let's also just include a factor controlling for the amount of time the animals spent in the experiment and not feeding (some genes related to metabolism might have a linear effect)
+design$hour = (design$TP * 4) - 4
+
+#so 1st let's have a model where we allow for an effect of Condition, Light, interactions thereof, and also linear effects of Temperature and time (which are continuous variables here)
+options(na.action = 'na.pass');
+mm = model.matrix( ~ 0 + Condition * Light + Temperature + hour, data = design)
+mm[is.na(mm)] <- 0
+
+mm <- mm[,colSums(mm) != 0]
+
+colnames(mm) <- gsub(":", "_", colnames(mm))
+
+#get the contrasts we are interested in...
+cmat <- makeContrasts(
+  Offset_dark = Conditionoffset - Conditionalign,
+  Offset_light = Conditionoffset + Conditionoffset_LightLight - Conditionalign,
+  Offset_ave = Conditionoffset + (Conditionoffset_LightLight / 2) - Conditionalign,
+  Light_Align = LightLight,
+  Temperature = Temperature,
+  Int = Conditionoffset_LightLight,
+  Light_Offset = LightLight + Conditionoffset_LightLight,
+  Light_average = LightLight + (Conditionoffset_LightLight / 2),
+  time = hour,
+  levels = colnames(mm))
+
+vq <- voomWithQualityWeights(y, mm, plot=FALSE)
+
+vfit <- lmFit(vq, mm)
+vfit <- contrasts.fit(vfit, contrasts=cmat)
+
+efit <- eBayes(vfit, robust=TRUE)
+
+summary(decideTests(efit))
+
+lapply(seq(1,9), function(i){
+  write.csv(topTable(efit, coef=i, confint=TRUE, number = Inf), file=paste0(colnames(efit)[i], "_efit.csv"))
+})
+
+##load in annotations from the genome assembly
+annot <- read.table("F:/circadian/Tag_Seq/SimR_annotations.txt", sep="\t", header=T, quote="")
+
+rownames(annot) <- annot$Gene
+
+lapply(seq(1,9), function(i){
+  x <- topTable(efit, coef=i, confint=TRUE, number = Inf)
+  write.csv(cbind(x, annot[rownames(x),]), file=paste0(colnames(efit)[i], "_ANNOTATED.csv"))
+  
+})
+
+sig_LD_Align <- topTable(efit, coef=4, confint=TRUE, number = Inf, p.value=0.05)
+sig_LD_Offset <- topTable(efit, coef=7, confint=TRUE, number = Inf, p.value=0.05)
+
+shared <- rownames(sig_LD_Align)[rownames(sig_LD_Align) %in% rownames(sig_LD_Offset)] #277 genes DE across LD separately in both time series
+
+cor(sig_LD_Align[shared,]$logFC, sig_LD_Offset[shared,]$logFC)
+plot(sig_LD_Align[shared,]$logFC, sig_LD_Offset[shared,]$logFC)
+#pretty strong negative correlation... which is why there are so few genes DE when the time series are considered together
+
+#so right off the bat, there are genes that differ between LD, but very few of these are in common across both Aligned and Offset ("Light_average"), Many genes differ in their response to light between the two treatments ("Int"). There is a substantial effect of time, and also apparently temperature. And some genes are just DE between Aligned and Offset, regardless of anything else (the only ones that are interesting are "Offset_ave", which differ in the same way in both light and dark).
+
+
+
+```
+
+Rhythmicity analysis. RAIN!
+This is the code for running RAIN; can also load in the pre-calculated results below
+```{r warning=FALSE}
+
+library(rain)
+
+df = read.table("TMM_tagSeq.txt", header=TRUE)
+
+
+df_align = df[,1:39]
+names(df_align) = paste0("ZT", rep(c(6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54), each=3) )
+
+df_offset = df[,40:78]
+names(df_offset) = paste0("ZT", rep(c(6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54), each=3) )
+
+results_align <- rain(t(df_align), deltat=4, period=24, nr.series=3,
+                peak.border=c(0.15, 0.85), verbose=TRUE, adjp.method = "Bonferroni")
+
+results_offset <- rain(t(df_offset), deltat=4, period=24, nr.series=3,
+                      peak.border=c(0.15, 0.85), verbose=TRUE, adjp.method = "Bonferroni")
+
+length(which(results_align$pVal < 0.05))
+#4217
+
+length(which(results_align$pVal < 0.01))
+#2868
+
+#correct phases
+results_align$phase = (results_align$phase + 2) %% 24
+results_offset$phase = (results_offset$phase + 2) %% 24
+
+results_align$Condition = "align"
+results_offset$Condition = "offset"
+
+results_align$Gene <- rownames(results_align)
+results_offset$Gene <- rownames(results_offset)
+
+df <- rbind(results_align, results_offset)
+
+#just look at the phase dists... there is a bit of a difference. We will come back to this later.
+ggplot(df[df$pVal < 0.01,], aes(x=phase, fill = Condition)) + geom_bar(position = "dodge") + theme_bw()
+
+sig_align = df$Gene[df$pVal < 0.01 & df$Condition == "align"]
+sig_offset = df$Gene[df$pVal < 0.01 & df$Condition == "offset"]
+
+summary(sig_align %in% sig_offset)
+summary(sig_offset %in% sig_align)
+
+#there are 1116 genes rhythmic in both time series, meaning >50% of rhythmic genes are not shared. Offset actually gains ~1300 rhythmic genes (and lose ~1800)
+
+#to define a stricter set of condition-specific genes, we exclude genes that are marginally significant in the other time series, so:
+Align_only <- sig_align[sig_align %in% results_offset[results_offset$pVal > 0.1,]$Gene] #1224 genes
+Offset_only <- sig_offset[sig_offset %in% results_align[results_align$pVal > 0.1,]$Gene] #921 genes
+
+#so, many genes really do genuinely gain rhythmicity during SC (they aren't just marginally rhythmic)
+
+```
+
+start from here to read in the pre-caluclated RAIN output
+```{r}
+results_align = read.csv("Align_RAIN.csv")
+results_offset = read.csv("Offset_RAIN.csv")
+
+rownames(results_align) = results_align$Gene
+sig_Align = results_align[results_align$pVal < 0.01,]
+rownames(results_offset) = results_offset$Gene
+sig_Offset = results_offset[results_offset$pVal < 0.01,]
+
+shared = sig_Align$Gene[sig_Align$Gene %in% sig_Offset$Gene]
+
+Align_only <- sig_Align[sig_Align$Gene %in% results_offset[results_offset$pVal > 0.1,]$Gene,]
+Offset_only <- sig_Offset[sig_Offset$Gene %in% results_align[results_align$pVal > 0.1,]$Gene,]
+
+#we used CircaCompare to get more precise phase estimates 
+sig_Offset$circ <- as.circular(sig_Offset$Circa_phase, units = "hours", rotation="clock")
+sig_Align$circ <- as.circular(sig_Align$Circa_phase, units = "hours", rotation="clock")
+
+hist(sig_Align[shared,]$Circa_phase)
+hist(sig_Align[Align_only$Gene,]$Circa_phase)
+hist(sig_Offset[shared,]$Circa_phase)
+hist(sig_Offset[Offset_only$Gene,]$Circa_phase)
+#phase distriubtions are bimodal, which is a common feature of circadian datasets
+
+
+##Here's a tidbit: Genes expressed during these transcriptional peaks were less likely to lose rhythmicity during SC.
+Peak_genes <- sig_Align[sig_Align$Circa_phase %between% c(0,6) | sig_Align$Circa_phase %between% c(12,18),]$Gene
+#n=1985
+Other_genes <- sig_Align$Gene[!sig_Align$Gene %in% Peak_genes] #n=883
+length(which(Peak_genes %in% Align_only$Gene))
+#753, 38%
+length(which(Other_genes %in% Align_only$Gene))
+#471, 53%
+
+chisq.test(c(753, 1985, 471, 883)) #p<2e-16
+
+#devtools::install_github("SMAC-Group/TwoCircles")
+library(TwoCircles)
+#this method is great because it is non-parametric (we violate distributional assumptions of other methods such as Watson)
+
+#takes a bit of time to run; runs bootstraps.
+circular_test(sig_Align$circ, sig_Offset$circ, test="rao") 
+
+ggplot(results_align[results_align$pVal < 0.01,], aes(x=Circa_phase)) + geom_histogram(binwidth=1) + theme_bw() + xlim(c(0,24)) 
+ggplot(results_offset[results_offset$pVal < 0.01,], aes(x=Circa_phase)) + geom_histogram(binwidth=1) + theme_bw() + xlim(c(0,24)) 
+
+#####
+#test for phase shifts between genes
+
+circ_comp_phase <- function(gene){
+  
+  a = melt( as.data.table( df_align[gene,] ) )
+  a$variable = as.numeric( sub('..', '', a$variable) )
+  
+  a$condition = "align"
+  
+  o = melt( as.data.table( df_offset[gene,] ) )
+  o$variable = as.numeric( sub('..', '', o$variable) )
+  
+  o$condition = "offset"
+  
+  df = rbind(a, o)
+  
+  res = circacompare(df, col_time="variable", col_outcome="value", col_group="condition", period=24, alpha_threshold = 0.5)
+ 
+  #phase dif est, p-value
+  return( res$summary$value[13:14] )
+  
+}
+
+#can explicitly test for difference relative to temp cycle:
+circ_comp_Temperature <- function(gene){
+  
+  a = melt( as.data.table( df_align[gene,] ) )
+  a$variable = as.numeric( sub('..', '', a$variable) )
+  
+  a$condition = "align" 
+  
+  o = melt( as.data.table( df_offset[gene,] ) )
+  o$variable = as.numeric( sub('..', '', o$variable) ) 
+  
+  #shift phase relative to Temp Cycle
+  o$variable = o$variable + 12
+ 
+  o$condition = "offset"
+  
+  df = rbind(a, o)
+  
+  res = circacompare(df, col_time="variable", col_outcome="value", col_group="condition", period=24, alpha_threshold = 0.5)
+  
+  #phase dif est, p-value
+  return( res$summary$value[13:14] )
+  
+}
+
+phase_test = sapply(shared, circ_comp_phase)
+
+phases = data.frame( t(phase_test) )
+names(phases) = c("Dif", "p")
+phases$padj = p.adjust(phases$p, method="BH")
+
+length(which(phases$padj < 0.01))
+#1092 / 1116!
+
+length(which(abs(phases$Dif) >= 6 & phases$padj < 0.01))
+#95% of shared genes (1055) shifted in phase by at least 6h
+length(which(abs(phases$Dif) >= 8))
+#86% by >= 8h
+length(which(abs(phases$Dif) >= 10))
+#58% by >= 10
+length(which(abs(phases$Dif) >= 11))
+#30% by >= 11
+hist(phases$Dif)
+
+#We define a set of genes that follow the temperature cycle: 
+phase_Temp = sapply(shared, circ_comp_Temperature)
+
+phases_Temp = data.frame( t(phases_Temp) )
+names(phases_Temp) = c("Dif", "p")
+phases_Temp$padj = p.adjust(phases_Temp$p, method="BH")
+
+length(which(phases_Temp$padj < 0.01))
+#113
+length(which(phases_Temp$padj < 0.05))
+#211
+
+test = cbind(phases, phases_Temp)
+
+Temp_follow <- rownames(test[test[,3] < 0.01 & test[,6] > 0.01 & abs(test[,1]) %between% c(10, 12),])
+length(Temp_follow)
+#647 genes did not shift relative to Temp (according to CircaCompare) and stayed within +- 2h
+
+```
+
+#GO/KEGG sliding window stuff
+
+GO analysis! Most recent go.obo and gomwu files are avaiable from https://github.com/z0on/GO_MWU
+
+```{r}
+setwd("F:/circadian/Tag_Seq/GO/align_window/")
+file_list <- list.files(".",pattern="MWU_CC")
+
+#need to label with the correct time window
+windows <- c(0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 3, 4, 5, 6, 7, 8 ,9)
+
+CC <- lapply(file_list, read.csv, sep=" ")
+for (i in 1:24){
+  CC[[i]]$Window = windows[i]
+}
+file_list <- list.files(".",pattern="MWU_BP")
+BP <- lapply(file_list, read.csv, sep=" ")
+for (i in 1:24){
+  BP[[i]]$Window = windows[i]
+}
+file_list <- list.files(".",pattern="MWU_MF")
+MF <- lapply(file_list, read.csv, sep=" ")
+for (i in 1:24){
+  MF[[i]]$Window = windows[i]
+}
+
+MWU_align <- do.call("rbind", c(CC, MF, BP)) %>% select(name, p.adj, Window)
+
+
+file_list <- list.files(".",pattern="KEGG")
+KEGG <- lapply(file_list, read.csv, sep=",")
+
+for (i in 1:24){
+  KEGG[[i]]$Window = windows[i]
+}
+
+KEGG_align <- do.call("rbind", KEGG) %>% select(ID, p.adjust, Window)
+
+
+setwd("F:/circadian/Tag_Seq/GO/offset_window/")
+file_list <- list.files(".",pattern="MWU_CC")
+
+#need to label with the correct time window
+windows <- c(0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 3, 4, 5, 6, 7, 8 ,9)
+
+CC <- lapply(file_list, read.csv, sep=" ")
+for (i in 1:24){
+  CC[[i]]$Window = windows[i]
+}
+file_list <- list.files(".",pattern="MWU_BP")
+BP <- lapply(file_list, read.csv, sep=" ")
+for (i in 1:24){
+  BP[[i]]$Window = windows[i]
+}
+file_list <- list.files(".",pattern="MWU_MF")
+MF <- lapply(file_list, read.csv, sep=" ")
+for (i in 1:24){
+  MF[[i]]$Window = windows[i]
+}
+
+MWU_offset <- do.call("rbind", c(CC, MF, BP)) %>% select(name, p.adj, Window)
+
+
+file_list <- list.files(".",pattern="KEGG")
+KEGG <- lapply(file_list, read.csv, sep=",")
+
+for (i in 1:24){
+  KEGG[[i]]$Window = windows[i]
+}
+
+KEGG_SC <- do.call("rbind", KEGG) %>% select(ID, p.adjust, Window)
+
+
+KEGG_align$Group <- "Align"
+KEGG_SC$Group <- "SC"
+
+KEGG <- rbind(KEGG_align, KEGG_SC)
+
+MWU_align$Group <- "Align"
+MWU_offset$Group <- "SC"
+
+MWU <- rbind(MWU_align, MWU_offset)
+
+#The Sliding window beginning with "0" was actually 0 -> 4, "1" is 1->5, 22 is 22-> 2, etc. So the windows that include 0 are 21, 22, 23, and 0
+#I think it's fair to then average over three windows (all of which definitely include the time point)
+
+get_scores <- function(term){
+  df <- MWU %>% filter(name==term)
+  
+  #fill in missing data with p=1
+  for (n in 0:23){
+    if (nrow(df %>% filter(Window == n)) == 1){
+      existing <- df[df$Window==n,]$Group
+      
+      if (existing == "Align"){
+        df <- rbind(df, df[df$Window==n, ])
+        df[nrow(df),]$Group="SC"
+        df[nrow(df),]$p.adj=1
+      } else {
+        df <- rbind(df, df[df$Window==n, ])
+        df[nrow(df),]$Group="Align"
+        df[nrow(df),]$p.adj=1
+      }
+    } else if (nrow(df %>% filter(Window == n)) == 0){
+      df <- rbind(df, df[1, ])
+      df[nrow(df),]$Group="SC"
+      df[nrow(df),]$p.adj=1
+      df[nrow(df),]$Window=n
+      
+      df <- rbind(df, df[1, ])
+      df[nrow(df),]$Group="Align"
+      df[nrow(df),]$p.adj=1
+      df[nrow(df),]$Window=n
+    }
+   
+  }
+  
+  df$Score = 0
+  
+ for (i in 0:23){
+    score <- df %>% filter(Window == i) %>% group_by(Group) %>% summarize(-log10(p.adj) )
+    
+    if (nrow(score)>=1){
+    df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="Align", ]$Score <- df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="Align", ]$Score + score[[2]][[1]]
+    } 
+    if (nrow(score)==2){
+    
+    df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="SC", ]$Score <- df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="SC", ]$Score + score[[2]][[2]]
+    }
+  }
+  
+  df$Score = df$Score/3
+  
+  return(df)
+}
+
+GO_coord_plot <- function(term){
+  df <- get_scores(term)
+  
+  df <- rbind(df, df[df$Window==0, ])
+  
+  
+  df[c(nrow(df), nrow(df)-1),]$Window=24
+  
+  png(file=paste0("F:/circadian/plots/Fig_TagSeq/GO_window_", term, ".png"), res=600, units='in', width=4, height=4 ) 
+  p <- ggplot(df, aes(x=Window, y=Score, fill=Group, color=Group)) + geom_point() + geom_area(alpha=0.3, position="identity")
+  
+  p <- p + geom_hline(yintercept = -log10(0.05), color="black") + ggtitle("Glycolysis/\ngluconeogenesis") + scale_fill_manual(values=c("grey", "steelblue")) + scale_color_manual(values=c("black", "black"))
+  
+  p <- p + coord_polar() + scale_x_continuous("", breaks = c(0, 6, 12, 18), limits = c(0, 24)) + theme_bw() + theme(text=element_text(size=18), legend.position="none")
+  
+  print(p)
+  dev.off()
+
+}
+
+MWU <- MWU %>% group_by(name) %>% filter(min(p.adj) < 0.05) %>% ungroup()
+
+
+MWU$name = sub("/", "_", MWU$name)
+
+sapply(unique(MWU$name), GO_coord_plot)
+
+get_scores <- function(term){
+  df <- KEGG %>% filter(ID==term)
+  
+  #fill in missing data with p=1
+  for (n in 0:23){
+    if (nrow(df %>% filter(Window == n)) == 1){
+      existing <- df[df$Window==n,]$Group
+      
+      if (existing == "Align"){
+        df <- rbind(df, df[df$Window==n, ])
+        df[nrow(df),]$Group="SC"
+        df[nrow(df),]$p.adjust=1
+      } else {
+        df <- rbind(df, df[df$Window==n, ])
+        df[nrow(df),]$Group="Align"
+        df[nrow(df),]$p.adjust=1
+      }
+    } else if (nrow(df %>% filter(Window == n)) == 0){
+      df <- rbind(df, df[1, ])
+      df[nrow(df),]$Group="SC"
+      df[nrow(df),]$p.adjust=1
+      df[nrow(df),]$Window=n
+      
+      df <- rbind(df, df[1, ])
+      df[nrow(df),]$Group="Align"
+      df[nrow(df),]$p.adjust=1
+      df[nrow(df),]$Window=n
+    }
+   
+  }
+  
+  df$Score = 0
+  
+  for (i in 0:23){
+    score <- df %>% filter(Window == i) %>% group_by(Group) %>% summarize(-log10(p.adjust) )
+    
+    if (nrow(score)>=1){
+    df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="Align", ]$Score <- df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="Align", ]$Score + score[[2]][[1]]
+    } 
+    if (nrow(score)==2){
+    
+    df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="SC", ]$Score <- df[df$Window %in% (seq(i+1, i+3)%%24) & df$Group=="SC", ]$Score + score[[2]][[2]]
+    }
+  }
+  
+  df$Score = df$Score/3
+  
+  return(df)
+}
+
+KEGG <- KEGG %>% group_by(ID) %>% filter(min(p.adjust) < 0.05) %>% ungroup()
+
+KEGG$ID = sub("/", "_", KEGG$ID)
+
+sapply(unique(KEGG$ID), GO_coord_plot)
+
+```
+
+
+
+code for calculating amplitude + phases with CircaCompare
+```{r, warning=FALSE, message=FALSE}
+
+#does circa_compare for individual genes, and returns AMPLTIUDE
+
+results_align$Amplitude = NA
+
+ids = results_align$Gene[results_align$pVal < 0.01]
+
+results_align[ids,]$Amplitude = sapply(ids, function(i){
+    test = melt( as.data.table( df_align[i,]) )
+    
+    test$variable = as.numeric( sub('..', '', test$variable) )
+    result <- circa_single(x = test, col_time="variable", col_outcome="value", period=24)
+    
+    return( result$summary$value[3] )
+})
+
+results_align$Circa_phase = NA
+
+results_align[ids,]$Circa_phase = sapply(ids, function(i){
+    test = melt( as.data.table( df_align[i,]) )
+    
+    test$variable = as.numeric( sub('..', '', test$variable) )
+    result <- circa_single(x = test, col_time="variable", col_outcome="value", period=24)
+    
+    return( result$summary$value[5] )
+})
+  
+```
+
+This chunk looks at the amplitude and mean expression of rhythmic genes.
+```{r, warning=FALSE, message=FALSE}
+#here, amplitude is half the distance between peak and trough. These are in log2cpm units. 
+hist(results_align$Amplitude)
+hist(results_offset$Amplitude)
+
+wilcox.test(results_align$Amplitude, results_offset$Amplitude)
+#p = 0.045
+
+#for expression level, we've got CPM on a log-2 scale. 
+results_align$expr = log2 (rowMeans( 2 ** df_align))
+results_offset$expr = log2 (rowMeans( 2 ** df_offset))
+
+sig_Align = results_align[results_align$pVal < 0.01,]
+sig_Offset = results_offset[results_offset$pVal < 0.01,]
+
+wilcox.test(sig_Align$expr, sig_Offset$expr); median(sig_Align$expr); median(sig_Offset$expr)
+#expression of Align genes slightly higher (4.9670 vs 4.8575; 31.276 vs. 28.990 cpm), p=0.0001
+
+wilcox.test(sig_Align[shared,]$expr, sig_Offset[shared,]$expr)
+#p=0.9
+wilcox.test(sig_Align[!sig_Align$Gene %in% shared,]$expr, sig_Offset[!sig_Offset$Gene %in% shared,]$expr)
+median(sig_Align[!sig_Align$Gene %in% shared,]$expr); median(sig_Offset[!sig_Offset$Gene %in% shared,]$expr)
+#p=1e-8, 4.802996 - 4.565157
+#(4.802996**2 - 4.565157**2) / 4.802996**2 = 9.7\%
+
+wilcox.test(sig_Align[!sig_Align$Gene %in% shared,]$Amplitude, sig_Offset[!sig_Offset$Gene %in% shared,]$Amplitude)
+#p=0.49
+wilcox.test(sig_Align[shared,]$Amplitude, sig_Offset[shared,]$Amplitude)
+median(sig_Align[shared,]$Amplitude); median(sig_Offset[shared,]$Amplitude)
+#p = 0.0002, 0.2684982 - 0.2494827
+#(0.2684982 - 0.2494827) / 0.2684982 = 7.08\% reduction in the median
+
+median( (results_offset[shared,]$Amplitude - results_align[shared,]$Amplitude) / results_align[shared,]$Amplitude )
+#7.13% #slightly different calculation; this the median difference
+
+wilcox.test(c(results_offset[shared,]$Amplitude, results_align[shared,]$Amplitude), c(results_align[!(results_align$Gene %in% shared),]$Amplitude, results_align[!(results_align$Gene %in% shared),]$Amplitude))
+
+#2e-16; shared rhythmic genes overall have higher Amplitude.
+
+summary(c(results_offset[shared,]$Amplitude, results_align[shared,]$Amplitude) )
+summary(c(results_align[!(results_align$Gene %in% shared),]$Amplitude, results_align[!(results_align$Gene %in% shared),]$Amplitude)) 
+
+mean(results_align[Temp_follow,]$Amplitude)
+mean(results_offset[Temp_follow,]$Amplitude) #specifically, Temp_following genes have much lower amplitudes during SC
+
+#forgive me for the hideous code, but this shows that Temp-following genes have higher amplitudes than other shared genes 
+(median(c(results_offset[not_Temp,]$Amplitude, results_align[not_Temp,]$Amplitude), na.rm=T) - median(c(results_align[Temp_follow,]$Amplitude, results_offset[Temp_follow,]$Amplitude)) ) / median(c(results_offset[not_Temp,]$Amplitude, results_align[not_Temp,]$Amplitude), na.rm=T)
+#16% HIGHER
+
+wilcox.test(results_align[Temp_follow,]$Amplitude, results_offset[Temp_follow,]$Amplitude)
+#p = 7e-4
+(median(results_align[Temp_follow,]$Amplitude) - median(results_offset[Temp_follow,]$Amplitude) ) / median(results_align[Temp_follow,]$Amplitude)
+#8.8% lower under SC
+
+not_Temp <- shared[!shared %in% Temp_follow]
+wilcox.test(results_align[not_Temp,]$Amplitude, results_offset[not_Temp,]$Amplitude)
+#p = 0.074, not sig.
+
+#so, overall slight difference in the amplitude of rhythmic genes. But, among **shared** genes, higher amplitude under aligned conditions. offset-only and align-only genes have lower amplitude in general, with no difference between Aligned and SC
+
+sig_align <- results_align[results_align$pVal < 0.01,]
+sig_offset <- results_offset[results_offset$pVal < 0.01,]
+
+to_plot <- rbind(sig_align, sig_offset)
+to_plot$Shared <- to_plot$Gene %in% shared
+to_plot$Shared<- factor(to_plot$Shared, levels = c("FALSE", "TRUE"),
+                  labels = c("Condition-specific", "Shared"))
+
+png(res=300, height=4, width=6, units='in', file="F:/circadian/Supplement/Amplitude_fig.png")
+ggplot(to_plot, aes(y=Amplitude, x=Condition, fill=Condition)) + geom_violin(width=1, alpha=0.2) + geom_boxplot(width=0.5, color="black", alpha=0.5, notch=T, notchwidth = 0.7, outlier.alpha = 0.3) + theme_bw() + facet_grid(.~Shared) + theme(legend.position="none", text=element_text(size=20, color="black")) + scale_fill_manual(values=c('lightgrey', 'steelblue')) + scale_x_discrete(labels = c("Aligned", "SC"))
+dev.off()
+
+plot_diff <- to_plot[to_plot$Shared==T,] %>% filter(Condition=="align") %>% summarize(Gene = Gene, Ampl_align = Amplitude) 
+plot_diff2 <- to_plot[to_plot$Shared==T,] %>% filter(Condition=="offset") %>% summarize(Gene = Gene, Ampl_SC = Amplitude) 
+
+plot_diff <- join(plot_diff, plot_diff2, by="Gene")
+
+ggplot(plot_diff, aes(x=Ampl_align, y=Ampl_SC)) + geom_point(alpha=0.2)+ theme_bw() + geom_abline(slope = 1, color="red") + geom_smooth()
+
+ggplot(to_plot[to_plot$Gene %in% temp,], aes(y=Amplitude, x=Condition, fill=Condition)) + geom_violin(alpha=0.2) + geom_boxplot(width=0.5, color="black", alpha=0.5) + theme_bw() + ylim(c(0,2))
+
+png(res=300, height=4, width=6, units='in', file="F:/circadian/Supplement/Expr_fig.png")
+ggplot(to_plot, aes(y=expr, x=Condition, fill=Condition)) + geom_violin(width=1, alpha=0.2) + geom_boxplot(width=0.5, color="black", alpha=0.5, notch=T, notchwidth = 0.7, outlier.alpha = 0.3) + theme_bw() + facet_grid(.~Shared) + theme(legend.position="none", text=element_text(size=20, color="black"), ) + scale_fill_manual(values=c('lightgrey', 'steelblue')) + scale_x_discrete(labels = c("Aligned", "SC")) + ylab("log2(CPM)")
+dev.off()
+
+
+```
+
+These next chunks compares ECHO, dryR, and RAIN results
+
+First, ECHO and RAIN
+```{r}
+library(echo.find)
+
+df = read.table("TMM_tagSeq_echo.txt", header=TRUE)
+head(df[,1:5])
+
+
+df_align = df[,1:40]
+names(df_align) = c("GeneName", paste0("ZT", rep(c(6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54), each=3) ))
+
+df_offset = df[,c(1, 41:79)]
+names(df_offset) = c("GeneName", paste0("ZT", rep(c(6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54), each=3) ))
+
+results <- echo_find(genes = df_align, begin = 6, end = 54, resol = 4, 
+  num_reps = 3, low = 20, high = 28, run_all_per = F, paired = F, rem_unexpr = F, is_normal = F,
+  is_de_linear_trend = F, is_smooth = F)
+
+head(results[,1:16])
+
+results <- results[order(results$`BH Adj P-Value`),]
+
+length(which(results$`BH Adj P-Value` < 0.01))
+
+summary(s2 %in% s1)
+#2624 (p = 0.05)
+
+##good agreement between ECHO and RAIN
+sig = results[which(results$`BH Adj P-Value` < 0.01), ]
+
+table(sig$`Oscillation Type`)
+#30.4% are damped or repressed, 25.8% forced or overexpressed, 43.8% "harmonic"
+
+sig[sig$`Oscillation Type` == "Overexpressed",]
+
+res_offset <- echo_find(genes = df_offset, begin = 6, end = 54, resol = 4, 
+  num_reps = 3, low = 20, high = 28, run_all_per = F, paired = F, rem_unexpr = F, is_normal = F,
+  is_de_linear_trend = F, is_smooth = F)
+
+sig_offset = res_offset[which(res_offset$`BH Adj P-Value` < 0.01), ]
+#1405 / 3958
+
+table(sig_offset$`Oscillation Type`)
+#24.2% damped, 29.1% forced, 46.7% harmonic
+
+ECHO_align = results
+ECHO_offset = res_offset
+
+results_align <- read.csv("Align_RAIN.csv")
+results_offset <- read.csv("Offset_RAIN.csv")
+
+
+sig_align = results_align[results_align$pVal < 0.01,]
+sig_offset = results_offset[results_offset$pVal < 0.01,]
+
+
+shared = sig_align$Gene[sig_align$Gene %in% sig_offset$Gene]
+
+cor.test(sig_align$pVal, ECHO_align[ECHO_align$`Gene Name` %in% sig_align$Gene,]$`BH Adj P-Value`)
+
+summary(ECHO_align[ECHO_align$`Gene Name` %in% sig_align$Gene,]$`P-Value`)
+
+summary(sig_align$Gene %in% ECHO_align[ECHO_align$`BH Adj P-Value` < 0.05,]$`Gene Name`)
+#2624 / 2868 (91.5%) of sig genes had an FDR < 0.05 in ECHO.
+
+results_align$Amp_change = ECHO_align[match(results_align$Gene, ECHO_align$`Gene Name`),]$Amplitude.Change.Coefficient
+results_offset$Amp_change = ECHO_offset[match(results_offset$Gene, ECHO_offset$`Gene Name`),]$Amplitude.Change.Coefficient
+
+```
+
+and dryR and RAIN
+
+```{r}
+setwd("F:/circadian/Tag_Seq")
+
+Res <- read.csv("dryR_results.csv", row.names = 1)
+
+length(which(Res$chosen_model_mean==2 ))
+#1079
+
+length(which(Res$chosen_model_mean==2 & Res$chosen_model ==1 ))
+#672 with different means but arrhythmic. 
+
+length(which(Res$chosen_model_mean==2 & Res$chosen_model ==2 ))
+#175 lose rhythmicity and different means (out of 1433)
+length(which(Res$chosen_model_mean==2 & Res$chosen_model ==3 ))
+#101 SC-specific and different means (out of 1000)
+length(which(Res$chosen_model_mean==2 & Res$chosen_model ==4 ))
+#27 different means and SC-modulated
+length(which(Res$chosen_model_mean==2 & Res$chosen_model ==5 ))
+#104 different means but shared parameters
+
+Align_specific <- Res[Res$chosen_model==2,]
+SC_specific <- Res[Res$chosen_model==3,]
+
+shared_same <- Res[Res$chosen_model==4,]
+shared_mod <- Res[Res$chosen_model==5,]
+shared_all <- rbind(shared_mod, shared_same)
+
+summary( sig_Align$Gene %in% c(rownames(Align_specific), rownames(shared_all) ) )
+#2194 / 2868
+summary( Align_only$Gene %in% rownames(Align_specific) )
+#785 / 1224
+summary( sig_Offset$Gene %in% c(rownames(SC_specific), rownames(shared_all) ) )
+#1767 / 2440
+summary( Offset_only$Gene %in% rownames(SC_specific) )
+#492 / 921
+
+summary(c(rownames(Align_specific), rownames(shared_all) ) %in% sig_Align$Gene)
+#2194/2654, 2499 p0.05
+summary(c(rownames(SC_specific), rownames(shared_all) ) %in% sig_Offset$Gene)
+#1767/2221, 2024 p0.05
+
+summary(shared %in% rownames(shared_all))
+#tru for 853
+summary(shared %in% rownames(shared_mod))
+#tru for 831
+summary(shared %in% rownames(shared_same))
+#just 22
+
+```
+
+
+#heatmaps
+```{r}
+
+detach("package:circular", unload = TRUE)
+#remove.packages('gplots'); library('devtools'); install_github("ChristophH/gplots")
+library(zoo)
+
+#average replicates (3x per time point) and calculate z-scores
+
+window_average = function(x){ sapply(seq(1,39, 3), function(i){
+                                      avg = mean(x[(1:3)+i-1])
+                                        })
+                                     }
+avg_a = apply(df_align, 1, window_average)
+
+Za = t( apply(avg_a, 2, function(n){ (n - mean(n)) / sd(n)  } ) )
+
+
+avg_o =  apply(df_offset, 1, window_average) 
+
+Zo = t( apply(avg_o, 2, function(n){ (n - mean(n)) / sd(n)  } ) )
+
+sig_A = sig_Align[order(sig_Align$Circa_phase),]$Gene
+sig_SC = sig_Offset[order(sig_Offset$Circa_phase),]$Gene
+
+library(gplots)
+library(RColorBrewer)
+
+#vir_yl = "#FDE725FF"
+#vir_bl = "#440154FF"
+dark_blue = "#051134"
+light_yl = "#ffffed"
+
+cols = colorRampPalette(bias=1.2,  c(dark_blue, rev(brewer.pal(n=9, name="YlGnBu")), light_yl))
+
+#align shared
+png(file="Heat_align_shared.png", res=300, height=8, width=4, units="in")
+heatmap.2(Za[sig_A[sig_A %in% shared],], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+#offset shared
+png(file="Heat_Offset_shared.png", res=300, height=8, width=4, units="in")
+heatmap.2(Zo[sig[sig %in% shared],], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+#align unique
+png(file="Heat_align_unique.png", res=300, height=8, width=4, units="in")
+heatmap.2(Za[sig[!sig %in% shared],], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+#align unique in Offset
+png(file="Heat_offset_unique.png", res=300, height=8, width=4, units="in")
+heatmap.2(Zo[sig[!sig %in% shared],], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+#align All
+png(file="Heat_align_ALL.png", res=300, height=8, width=4, units="in")
+heatmap.2(Za[sig,], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+#Offset All
+png(file="Heat_Offset_ALL.png", res=300, height=8, width=4, units="in")
+heatmap.2(Zo[sig,], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+sig = sig_Offset[order(sig_Offset$Circa_phase),]$Gene
+
+png(file="Heat_Align_OffsetUnique.png", res=300, height=8, width=4, units="in")
+heatmap.2(Za[sig[!sig %in% shared],], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+png(file="Heat_OffsetUnique.png", res=300, height=8, width=4, units="in")
+heatmap.2(Zo[sig[!sig %in% shared],], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+gene_order = c(sig_A[!sig_A %in% sig_SC], sig_A[sig_A %in% sig_SC], sig_SC[!sig_SC %in% sig_A])
+  
+png(file="F:/circadian/plots/Fig_TagSeq/Heat_Align_Full.png", res=600, height=12, width=4, units="in")
+heatmap.2(Za[gene_order,], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, density.info = "none", keysize = 2, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+png(file="F:/circadian/plots/Fig_TagSeq/Heat_SC_Full.png", res=600, height=12, width=4, units="in")
+heatmap.2(Zo[gene_order,], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=F, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+png(file="F:/circadian/plots/Fig_TagSeq/Heat_Key.png", res=600, height=4, width=8, units="in")
+heatmap.2(Za[gene_order,], Colv = F, Rowv = F, dendrogram="none", scale="none", trace="none", key=T, density.info = "none", keysize = 3, labRow = FALSE, margins=c(1,1), col=cols)
+dev.off()
+
+```
