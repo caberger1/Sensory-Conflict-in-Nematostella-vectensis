@@ -419,3 +419,95 @@ p1 = p_lsp_fun(rando_smooth_circ, perm=2000)
 
 
 ```
+
+Analysis of short-period (12h) light and temperature cycles (for Figure 2–Figure supplement 1)
+
+```{r}
+metadata = read.csv("metadata_LD66.csv")
+metadata = data.table(metadata, key="ID")
+
+df = read.csv("activity_datasheet_66.csv")
+
+names(df)[3] = "Raw_distance"
+names(df)[4] = "Filtered_distance"
+names(df)[7] = "Percent_active"
+names(df)[9] = "Normalized_raw_movement"
+names(df)[10] = "Normalized_filtered_movement"
+
+smooth_fun = function(j){
+  smooth = cma(y=as.numeric(j) , order=4)
+  return(smooth$fitted)
+}
+
+df <- df %>% group_by(ID) %>%  mutate(smoothed = smooth_fun(Normalized_filtered_movement))
+df <- data.table(df, key = "ID")
+
+dt = behavr(df[df$ID %in% metadata$ID,], metadata)
+dt$t = dt$bin * 3600
+
+#Looking at the metadata, most of these have some kind of circadian component (actually, more have a circadian p < 0.01 than a circatidal). However, the mean time series do not 
+
+#looking at the plots, though, you can see that not all of these have the same "phase" -- as in, since the 12-h cycles are identical, there's no a priori reason for one time point to be "ZT0" and one to be "ZT12". This can be seen most clearly with "102822_left_com_4". 
+
+ggetho(dt, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(6)) + stat_pop_etho() + facet_wrap(. ~ ID) + ggetho::scale_x_hours() + theme_bw() + stat_ld_annotations(height=1, alpha=0.2, outline=NA, ld_colours = c("white", "blue"), phase=hours(0))
+
+#To deal with this, I think it makes sense to "align" these as if they were in the same 12-h phase, and then take a new mean time series.
+
+#If it's false, flip
+flip_summary <- dt %>% group_by(ID) %>% summarize(mean(smoothed[ZT<12]) > mean(smoothed[ZT>=12]))
+
+to_flip <- unique(dt$ID)[!flip_summary[,2][[1]]]
+
+dt_flip <- dt
+
+dt_flip[ID %in% to_flip]$ZT <- (dt_flip[ID %in% to_flip]$ZT - 12) %% 24
+dt_flip[ID %in% to_flip]$bin <- (dt_flip[ID %in% to_flip]$bin - 12) 
+dt_flip$bin <- dt_flip$bin + 24
+
+dt_flip$t <- dt_flip$bin * 3600
+
+dt_LD <- behavr(dt[dt$ID %in% metadata[Group=="LD66_cycle",]$ID,], metadata)
+dt_LD_flip <- behavr(dt_flip[dt_flip$ID %in% metadata[Group=="LD66_cycle",]$ID,], metadata)
+LD_mean <- dt_LD %>% group_by(bin) %>% summarize(mean(smoothed))
+LD_mean_flip <- dt_LD_flip %>% group_by(bin) %>% summarize(mean(smoothed))
+
+ggetho(dt_LD, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + facet_grid(Condition ~ Offset) + ggetho::scale_x_hours() + theme_bw()
+
+ggetho(dt_LD_flip, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + facet_grid(Condition ~ Offset) + ggetho::scale_x_hours() + theme_bw()
+
+ggetho(dt_LD, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + theme_bw()
+
+ggetho(dt_LD_flip, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + theme_bw() 
+
+#this shows that when we "flip" the time series in this way, we recover a strong 24h component
+a = randlsp(LD_mean$`mean(smoothed)`, type="period", ofac=50, from=10,to=34, alpha = 0.01, repeats=2000)
+b = randlsp(LD_mean_flip$`mean(smoothed)`, type="period", ofac=50, from=10,to=34, alpha = 0.01, repeats=2000)
+
+
+#And for temperature cycles:
+dt_TC <- behavr(dt[dt$ID %in% metadata[Group=="TC66_cycle",]$ID,], metadata)
+dt_TC_flip <- behavr(dt_flip[dt_flip$ID %in% metadata[Group=="TC66_cycle",]$ID,], metadata)
+TC_mean <- dt_TC %>% group_by(bin) %>% summarize(mean(smoothed))
+TC_mean_flip <- dt_TC_flip %>% group_by(bin) %>% summarize(mean(smoothed))
+
+ggetho(dt_TC, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + facet_grid(Condition ~ Offset) + ggetho::scale_x_hours() + theme_bw()
+
+ggetho(dt_TC_flip, summary_time_window = hours(1), aes(x = t, y = smoothed, colour=Condition)) +
+  stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + facet_grid(Condition ~ Offset) + ggetho::scale_x_hours() + theme_bw()
+
+ggetho(dt_TC, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + theme_bw()
+
+ggetho(dt_TC_flip, summary_time_window = hours(1), aes(x=t, y=smoothed, colour=Condition), time_wrap = hours(24)) +
+  facet_grid(Offset ~ .) + stat_ld_annotations(height=1, alpha=0.3, outline=NA, period=hours(12), l_duration = hours(6), phase=hours(0)) + stat_pop_etho() + theme_bw() 
+
+a = randlsp(TC_mean$`mean(smoothed)`, type="period", ofac=50, from=10,to=34, alpha = 0.01, repeats=2000)
+b = randlsp(TC_mean_flip$`mean(smoothed)`, type="period", ofac=50, from=10,to=34, alpha = 0.01, repeats=2000)
+
+```
